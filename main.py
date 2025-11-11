@@ -109,7 +109,7 @@ def get_args_parser():
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
-    parser.add_argument('--config_path',default='config.yaml', help='path to .yaml configuration file')
+    parser.add_argument('--config_path',default=None, help='path to .yaml configuration file')
     return parser
 
 

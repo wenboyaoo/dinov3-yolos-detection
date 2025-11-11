@@ -44,7 +44,7 @@ device: cuda
 seed: 42
 resume: # resume from checkpoint
 start_epoch: 0
-eval: True
+eval: False
 num_workers: 2
 # distributed training parameters
 world_size: 1
