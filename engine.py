@@ -5,9 +5,10 @@ Train and eval functions used in main.py
 import math
 import os
 import sys
-from typing import Iterable
+from typing import Iterable, Optional
 
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 import util.misc as utils
 from datasets.coco_eval import CocoEvaluator
@@ -72,7 +73,8 @@ from datasets.coco_eval import CocoEvaluator
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, max_norm: float = 0):
+                    device: torch.device, epoch: int, max_norm: float = 0,
+                    tb_writer: Optional[SummaryWriter] = None):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -83,7 +85,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
     # count = 0
 
-    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
+    num_batches = len(data_loader)
+    for batch_idx, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         
         # count += 1
         # if count == 10: break
@@ -120,14 +123,29 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         metric_logger.update(class_error=loss_dict_reduced['class_error'])
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+
+        if tb_writer is not None and utils.is_main_process():
+            global_step = epoch * num_batches + batch_idx
+            tb_writer.add_scalar('train/loss', loss_value, global_step)
+            tb_writer.add_scalar('train/lr', optimizer.param_groups[0]["lr"], global_step)
+            tb_writer.add_scalar('train/class_error', loss_dict_reduced['class_error'].item(), global_step)
+            for k, v in loss_dict_reduced_scaled.items():
+                tb_writer.add_scalar(f'train/{k}', v.item(), global_step)
+            for k, v in loss_dict_reduced_unscaled.items():
+                tb_writer.add_scalar(f'train/{k}', v.item(), global_step)
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    epoch_stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    if tb_writer is not None and utils.is_main_process():
+        for k, v in epoch_stats.items():
+            tb_writer.add_scalar(f'epoch_train/{k}', v, epoch)
+    return epoch_stats
 
 
 @torch.no_grad()
-def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir):
+def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir,
+             epoch: Optional[int] = None, tb_writer: Optional[SummaryWriter] = None):
     model.eval()
     criterion.eval()
 
@@ -190,4 +208,20 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
         stats['PQ_all'] = panoptic_res["All"]
         stats['PQ_th'] = panoptic_res["Things"]
         stats['PQ_st'] = panoptic_res["Stuff"]
+    if tb_writer is not None and utils.is_main_process():
+        log_step = epoch if epoch is not None else 0
+        for k, v in stats.items():
+            if isinstance(v, (int, float)):
+                tb_writer.add_scalar(f'eval/{k}', v, log_step)
+        if 'coco_eval_bbox' in stats:
+            bbox_stats = stats['coco_eval_bbox']
+            bbox_names = ['AP','AP50','AP75','AP_small','AP_medium','AP_large','AR1','AR10','AR100','AR_small','AR_medium','AR_large']
+            for name, val in zip(bbox_names, bbox_stats):
+                tb_writer.add_scalar(f'eval/bbox_{name}', val, log_step)
+        if 'coco_eval_masks' in stats:
+            mask_stats = stats['coco_eval_masks']
+            mask_names = ['AP','AP50','AP75','AP_small','AP_medium','AP_large','AR1','AR10','AR100','AR_small','AR_medium','AR_large']
+            for name, val in zip(mask_names, mask_stats):
+                tb_writer.add_scalar(f'eval/mask_{name}', val, log_step)
+
     return stats, coco_evaluator

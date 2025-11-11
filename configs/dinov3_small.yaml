@@ -1,0 +1,51 @@
+lr: 2.5e-5
+lr_backbone: 1e-5
+batch_size: 1
+weight_decay: 1e-4
+epochs: 150
+eval_size: 800
+clip_max_norm: 0.1
+use_checkpoint: False
+# scheduler
+sched: warmupcos # options: ["step", "warmupcos"]
+## step
+lr_drop: 100
+## warmupcosine
+warmup-lr: 1e-6
+min-lr: 1e-7
+warmup-epochs: 0
+decay-rate: 0.1
+# model setting
+det_token_num: 100
+backbone: vanilla_vit # options: ["vanilla_vit", "dinov3"]
+backbone_size: small
+finetune: True
+## vanilla_vit
+pre_trained: # set imagenet pretrained model path if not train yolos from scatch
+init_pe_size: [512,864]
+mid_pe_size: [512,864]
+# Matcher
+set_cost_class: 1
+set_cost_bbox: 5
+set_cost_giou: 2
+# Loss coefficients
+dice_loss_coef: 1
+bbox_loss_coef: 5
+giou_loss_coef: 2
+eos_coef: 0.1
+# dataset parameters
+dataset_file: voc # options: ["coco","voc"]
+coco_path:
+coco_panoptic_path:
+remove_difficult: False
+
+output_dir: outputs/dinov3_small/
+device: cuda
+seed: 42
+resume: # resume from checkpoint
+start_epoch: 0
+eval: True
+num_workers: 2
+# distributed training parameters
+world_size: 1
+dist_url: env://

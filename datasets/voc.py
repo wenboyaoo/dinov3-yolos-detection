@@ -180,13 +180,11 @@ def make_coco_transforms(image_set):
 
 def build(image_set, args):
     root = Path(args.coco_path)
-    assert root.exists(), f'provided VOC path {root} does not exist'
-    mode = 'instances'
-    PATHS = {
-        "train": (root / "images" / "train", root / "annotations" / "voc_train.json"),
-        "val": (root / "images" / "val", root / "annotations" / "voc_val.json"),
+    assert root.exists(), f'provided COCO path {root} does not exist'
+    JSON_PATHS = {
+        "train": (root / f'train.json'),
+        "val": (root / f'val.json'),
     }
-
-    img_folder, ann_file = PATHS[image_set]
-    dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms(image_set), return_masks=args.masks)
+    img_folder, ann_file = root / "JPEGImages", JSON_PATHS[image_set]
+    dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms(image_set, args), return_masks=False)
     return dataset

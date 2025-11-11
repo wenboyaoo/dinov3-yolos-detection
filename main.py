@@ -2,6 +2,7 @@
 import argparse
 import datetime
 import json
+import yaml
 import random
 import time
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
 
 import datasets
 import util.misc as utils
@@ -107,7 +109,20 @@ def get_args_parser():
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+    parser.add_argument('--config_path',default='config.yaml', help='path to .yaml configuration file')
     return parser
+
+
+def load_config(path, args):
+    if path is None:
+        return args
+    with open(path, 'r') as f:
+        cfg = yaml.safe_load(f) or {}
+    for k, v in cfg.items():
+        if v is not None:
+            setattr(args, k, v)
+
+    return args
 
 
 def main(args):
@@ -190,6 +205,10 @@ def main(args):
 
 
     output_dir = Path(args.output_dir)
+    tb_writer = None
+    if args.output_dir and utils.is_main_process():
+        (output_dir / 'tb').mkdir(parents=True, exist_ok=True)
+        tb_writer = SummaryWriter(log_dir=str(output_dir / 'tb'))
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -204,9 +223,12 @@ def main(args):
 
     if args.eval:
         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
-                                              data_loader_val, base_ds, device, args.output_dir)
+                                              data_loader_val, base_ds, device, args.output_dir,
+                                              epoch=args.start_epoch-1, tb_writer=tb_writer)
         if args.output_dir:
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
+        if tb_writer is not None:
+            tb_writer.close()
         return
 
     print("Start training")
@@ -216,7 +238,7 @@ def main(args):
             sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm)
+            args.clip_max_norm, tb_writer=tb_writer)
         lr_scheduler.step(epoch)
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
@@ -233,7 +255,8 @@ def main(args):
                 }, checkpoint_path)
 
         test_stats, coco_evaluator = evaluate(
-            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
+            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
+            epoch=epoch, tb_writer=tb_writer
         )
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
@@ -259,11 +282,14 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+    if tb_writer is not None:
+        tb_writer.close()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('YOLOS training and evaluation script', parents=[get_args_parser()])
     args = parser.parse_args()
+    args = load_config(args.config_path, args)
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)

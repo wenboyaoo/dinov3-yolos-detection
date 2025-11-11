@@ -1,8 +1,33 @@
-cython
-git+https://github.com/cocodataset/cocoapi.git#subdirectory=PythonAPI&egg=pycocotools
-submitit
-torch>=1.5.0
-torchvision>=0.6.0
+# Core deep learning stack
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Model & transformer utilities
+transformers>=4.40.0
+huggingface-hub>=0.20.0
+einops>=0.6.0
+typing_extensions
+
+# Data processing & math
+numpy
 scipy
+cython
+pyyaml
+Pillow
+tqdm
+
+# Detection / evaluation
+pycocotools
+submitit
+
+# Visualization / logging
+tensorboard>=2.0
+matplotlib
+opencv-python
+
+# ONNX export / runtime (optional but already referenced)
 onnx
 onnxruntime
+
+# Others potentially used by plotting or scripts
+requests
