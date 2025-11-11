@@ -22,7 +22,6 @@ from util.scheduler import create_scheduler
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set YOLOS', add_help=False)
-    parser.add_argument("--finetune", action="store_true")
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--lr_backbone', default=1e-5, type=float)
     parser.add_argument('--batch_size', default=2, type=int)
@@ -61,8 +60,11 @@ def get_args_parser():
     # * model setting
     parser.add_argument("--det_token_num", default=100, type=int,
                         help="Number of det token in the deit backbone")
-    parser.add_argument('--backbone_name', default='tiny', type=str,
-                        help="Name of the deit backbone to use")
+    parser.add_argument('--backbone', default='dinov3', type=str,
+                        help="Name of the backbone to use"),
+    parser.add_argument('--backbone_size', default='dinov3', type=str,
+                        help="Size of the backbone to use"),
+    parser.add_argument("--finetune", action="store_true"),
     parser.add_argument('--pre_trained', default='',
                         help="set imagenet pretrained model path if not train yolos from scatch")
     parser.add_argument('--init_pe_size', nargs='+', type=int,

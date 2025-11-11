@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 from functools import partial
 
-from .backbone import *
+from .backbones import build_backbone
 
 
 from .matcher import build_matcher
@@ -31,10 +31,10 @@ class MLP(nn.Module):
         return x
 
 class Detector(nn.Module):
-    def __init__(self, num_classes, pre_trained=None, finetune=False, det_token_num=100, backbone_name='tiny', use_checkpoint=False):
+    def __init__(self, num_classes, pre_trained=None, finetune=False, det_token_num=100, backbone='dinov3', backbone_size='small', use_checkpoint=False):
         super().__init__()
         # import pdb;pdb.set_trace()
-        self.backbone, hidden_dim = build_backbone(size=backbone_name, pretrained=pre_trained, finetune=finetune, num_det_token=det_token_num, use_checkpoint=use_checkpoint)
+        self.backbone, hidden_dim = build_backbone(backbone=backbone, size=backbone_size, pretrained=pre_trained, finetune=finetune, num_det_token=det_token_num, use_checkpoint=use_checkpoint)
         self.class_embed = MLP(hidden_dim, hidden_dim, num_classes + 1, 3)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
     
@@ -42,8 +42,7 @@ class Detector(nn.Module):
         # import pdb;pdb.set_trace()
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
-        x = self.backbone(pixel_values=samples.tensors).last_hidden_state
-        x = x[:, 1:1+self.backbone.num_det_token,:]
+        x = self.backbone(samples.tensors)
         outputs_class = self.class_embed(x)
         outputs_coord = self.bbox_embed(x).sigmoid()
         out = {'pred_logits': outputs_class, 'pred_boxes': outputs_coord}
@@ -277,7 +276,8 @@ def build(args):
         num_classes=num_classes,
         pre_trained=args.pre_trained,
         det_token_num=args.det_token_num,
-        backbone_name=args.backbone_name,
+        backbone=args.backbone,
+        backbone_size=args.backbone_size,
         finetune=args.finetune,
         use_checkpoint=args.use_checkpoint
     )

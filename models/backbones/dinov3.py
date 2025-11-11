@@ -8,7 +8,7 @@ from transformers.utils import TransformersKwargs, auto_docstring
 from transformers.utils.generic import check_model_inputs
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 
-BACKBONE_CONFIG = {
+DINOV3_CONFIG = {
     'small':{'repo_id':'facebook/dinov3-vits16-pretrain-lvd1689m', 'hidden_dim':384}
 }
 
@@ -91,12 +91,16 @@ class DINOv3ViTDet(DINOv3ViTModel):
             pooler_output=pooled_output,
         )
     
-def build_backbone(size='small', pretrained=False, **kwargs):
-    assert size in BACKBONE_CONFIG.keys()
+class DINOv3Backbone(DINOv3ViTDet):
+    def forward(self, x):
+        return super().forward(x, bool_masked_pos = None, head_mask = None).last_hidden_state[:, 1:1+self.num_det_token,:]
+
+def build_dinov3(size='small', pretrained=False, **kwargs):
+    assert size in DINOV3_CONFIG.keys()
     if pretrained:
-        model = DINOv3ViTDet.from_pretrained(BACKBONE_CONFIG[size]['repo_id'], ignore_mismatched_sizes=True, **kwargs)
+        model = DINOv3Backbone.from_pretrained(DINOV3_CONFIG[size]['repo_id'], ignore_mismatched_sizes=True, **kwargs)
     else:
-        config = DINOv3ViTDetConfig.from_pretrained(BACKBONE_CONFIG[size]['repo_id'], **kwargs)
-        model = DINOv3ViTDet(config)
-    return model, BACKBONE_CONFIG[size]['hidden_dim']
+        config = DINOv3ViTDetConfig.from_pretrained(DINOV3_CONFIG[size]['repo_id'], **kwargs)
+        model = DINOv3Backbone(config)
+    return model, DINOV3_CONFIG[size]['hidden_dim']
 
