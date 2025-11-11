@@ -22,6 +22,7 @@ from util.scheduler import create_scheduler
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set YOLOS', add_help=False)
+    parser.add_argument("--finetune", action="store_true")
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--lr_backbone', default=1e-5, type=float)
     parser.add_argument('--batch_size', default=2, type=int)
