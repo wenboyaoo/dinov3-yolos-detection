@@ -94,10 +94,11 @@ class DINOv3Backbone(DINOv3ViTDet):
     def forward(self, x):
         return super().forward(x, bool_masked_pos = None, head_mask = None).last_hidden_state[:, 1:1+self.num_det_token,:]
 
-def build_dinov3(size='small', pretrained=False, **kwargs):
-    assert size in DINOV3_CONFIG.keys()
+def build_dinov3(size='small', pretrained=False, pretrained_path=None, **kwargs):
+    assert size in DINOV3_CONFIG.keys(), f'Unknown model size: {size}'
     if pretrained:
-        model = DINOv3Backbone.from_pretrained(DINOV3_CONFIG[size]['repo_id'], ignore_mismatched_sizes=True, **kwargs)
+        path = pretrained_path or DINOV3_CONFIG[size]['repo_id']
+        model = DINOv3Backbone.from_pretrained(path, ignore_mismatched_sizes=True, **kwargs)
     else:
         config = DINOv3ViTDetConfig.from_pretrained(DINOV3_CONFIG[size]['repo_id'], **kwargs)
         model = DINOv3Backbone(config)

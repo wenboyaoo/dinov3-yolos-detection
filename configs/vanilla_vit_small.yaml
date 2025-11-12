@@ -19,9 +19,10 @@ decay_rate: 0.1
 det_token_num: 100
 backbone: vanilla_vit # options: ["vanilla_vit", "dinov3"]
 backbone_size: small
+pretrained: True
+pretrained_path:
 finetune: False
 ## vanilla_vit
-pre_trained: # set imagenet pretrained model path if not train yolos from scatch
 init_pe_size: [512,864]
 mid_pe_size: [512,864]
 # Matcher
