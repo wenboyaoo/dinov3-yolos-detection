@@ -418,7 +418,7 @@ def tiny(pretrained=None, **kwargs):
         #     url="https://dl.fbaipublicfiles.com/deit/deit_tiny_patch16_224-a1311bcf.pth",
         #     map_location="cpu", check_hash=True
         # )
-        checkpoint = torch.load(pretrained, map_location="cpu")
+        checkpoint = torch.load(pretrained, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"], strict=False)
     return model
 
@@ -433,7 +433,7 @@ def small(pretrained=None, **kwargs):
         #     url="https://dl.fbaipublicfiles.com/deit/deit_small_patch16_224-cd65a155.pth",
         #     map_location="cpu", check_hash=True
         # )
-        checkpoint = torch.load(pretrained, map_location="cpu")
+        checkpoint = torch.load(pretrained, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"], strict=False)
     return model
 
@@ -445,7 +445,7 @@ def small_dWr(pretrained=None, **kwargs):
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     if pretrained:
         # checkpoint = torch.load('fa_deit_ldr_14_330_240.pth', map_location="cpu")
-        checkpoint = torch.load(pretrained, map_location="cpu")
+        checkpoint = torch.load(pretrained, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"], strict=False)
     return model
 
@@ -460,7 +460,7 @@ def base(pretrained=None, **kwargs):
         #     url="https://dl.fbaipublicfiles.com/deit/deit_base_distilled_patch16_384-d0272ac0.pth",
         #     map_location="cpu", check_hash=True
         # )
-        checkpoint = torch.load(pretrained, map_location="cpu")
+        checkpoint = torch.load(pretrained, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"], strict=False)
     return model
 
