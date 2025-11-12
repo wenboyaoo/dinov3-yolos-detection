@@ -20,7 +20,7 @@ det_token_num: 100
 backbone: vanilla_vit # options: ["vanilla_vit", "dinov3"]
 backbone_size: small
 pretrained: True
-pretrained_path:
+pretrained_path: pretrained/deit_s_width_200.pth
 finetune: False
 ## vanilla_vit
 init_pe_size: [512,864]
