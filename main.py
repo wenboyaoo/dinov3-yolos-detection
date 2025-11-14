@@ -66,7 +66,7 @@ def get_args_parser():
                         help="Name of the backbone to use"),
     parser.add_argument('--backbone_size', default='dinov3', type=str,
                         help="Size of the backbone to use"),
-    parser.add_argument('--finetune', action="store_true"),
+    parser.add_argument('--freeze_backbone', action="store_true"),
     parser.add_argument('--pretrained',action="store_true"),
     parser.add_argument('--pretrained_path', default= None),
     parser.add_argument('--init_pe_size', nargs='+', type=int,
@@ -145,7 +145,7 @@ def main(args):
 
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)

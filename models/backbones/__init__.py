@@ -7,5 +7,5 @@ BACKBONE_BUILDERS = {
 }
 
 def build_backbone(backbone='dinov3', **kwargs):
-    assert backbone in BACKBONE_BUILDERS.keys()
+    assert backbone in BACKBONE_BUILDERS.keys(), f"Backbone '{backbone}' not supported. "
     return BACKBONE_BUILDERS[backbone](**kwargs)

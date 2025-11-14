@@ -1,6 +1,6 @@
-lr: 2.5e-5
-lr_backbone: 1.0e-5
-batch_size: 1
+lr: 7.0e-5
+lr_backbone: 3.0e-5
+batch_size: 8
 weight_decay: 1.0e-4
 epochs: 150
 eval_size: 800
@@ -13,40 +13,40 @@ lr_drop: 100
 ## warmupcosine
 warmup_lr: 1.0e-6
 min_lr: 1.0e-7
-warmup_epochs: 0
+warmup_epochs: 3
 decay_rate: 0.1
 # model setting
 det_token_num: 100
-backbone: dinov3 # options: ["vanilla_vit", "dinov3"]
+backbone: vanilla_vit # options: ["vanilla_vit", "dinov3"]
 backbone_size: small
 pretrained: True
-pretrained_path: # Leave blank to use the default HF repo
-finetune: True
+pretrained_path: pretrained/deit_s_width_200.pth
+freeze_backbone: True
 ## vanilla_vit
 init_pe_size: [512,864]
 mid_pe_size: [512,864]
 # Matcher
-set_cost_class: 1
+set_cost_class: 3
 set_cost_bbox: 5
 set_cost_giou: 2
 # Loss coefficients
 dice_loss_coef: 1
 bbox_loss_coef: 5
 giou_loss_coef: 2
-eos_coef: 0.1
+eos_coef: 0.3
 # dataset parameters
 dataset_file: voc # options: ["coco","voc"]
 coco_path: data/voc2012/
 coco_panoptic_path:
-remove_difficult: True
+remove_difficult: False
 
-output_dir: outputs/dinov3_small/voc/finetune
+output_dir: outputs/vanilla_vit/small/voc/freeze
 device: cuda
 seed: 42
 resume: # resume from checkpoint
 start_epoch: 0
 eval: False
-num_workers: 2
+num_workers: 12
 # distributed training parameters
 world_size: 1
 dist_url: env://

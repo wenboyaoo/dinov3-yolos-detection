@@ -31,10 +31,10 @@ class MLP(nn.Module):
         return x
 
 class Detector(nn.Module):
-    def __init__(self, num_classes, pretrained=False, pretrained_path=None, finetune=False, det_token_num=100, backbone='dinov3', backbone_size='small', use_checkpoint=False):
+    def __init__(self, num_classes, pretrained=False, pretrained_path=None, freeze_backbone=True, det_token_num=100, backbone='dinov3', backbone_size='small', use_checkpoint=False):
         super().__init__()
         # import pdb;pdb.set_trace()
-        self.backbone, hidden_dim = build_backbone(backbone=backbone, size=backbone_size, pretrained=pretrained, pretrained_path=pretrained_path, finetune=finetune, num_det_token=det_token_num, use_checkpoint=use_checkpoint)
+        self.backbone, hidden_dim = build_backbone(backbone=backbone, size=backbone_size, pretrained=pretrained, pretrained_path=pretrained_path, freeze=freeze_backbone, num_det_token=det_token_num, use_checkpoint=use_checkpoint)
         self.class_embed = MLP(hidden_dim, hidden_dim, num_classes + 1, 3)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
     
@@ -282,7 +282,7 @@ def build(args):
         det_token_num=args.det_token_num,
         backbone=args.backbone,
         backbone_size=args.backbone_size,
-        finetune=args.finetune,
+        freeze_backbone=args.freeze_backbone,
         use_checkpoint=args.use_checkpoint
     )
     matcher = build_matcher(args)
