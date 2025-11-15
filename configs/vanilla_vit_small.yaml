@@ -3,7 +3,7 @@ lr_backbone: 1.0e-4
 batch_size: 16
 weight_decay: 1.0e-4
 epochs: 150
-eval_size: 800
+eval_size: 512
 clip_max_norm: 0.1
 use_checkpoint: False
 # scheduler
@@ -13,7 +13,7 @@ lr_drop: 100
 ## warmupcosine
 warmup_lr: 1.0e-6
 min_lr: 1.0e-7
-warmup_epochs: 3
+warmup_epochs: 0
 decay_rate: 0.1
 # model setting
 det_token_num: 100
@@ -26,7 +26,7 @@ freeze_backbone: False
 init_pe_size: [512,864]
 mid_pe_size: [512,864]
 # Matcher
-set_cost_class: 3
+set_cost_class: 4
 set_cost_bbox: 5
 set_cost_giou: 2
 # Loss coefficients
