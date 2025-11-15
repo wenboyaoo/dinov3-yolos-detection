@@ -6,7 +6,6 @@ import yaml
 import random
 import time
 from pathlib import Path
-import sys
 
 import numpy as np
 import torch
@@ -119,200 +118,11 @@ def load_config(path, args):
         return args
     with open(path, 'r') as f:
         cfg = yaml.safe_load(f) or {}
-    # Determine which arguments were explicitly provided on the command line.
-    # We only want to override args from the config file when the user did NOT
-    # provide that argument via CLI. This makes CLI take precedence over config.
-    provided = set()
-    for token in sys.argv[1:]:
-        if token.startswith('--'):
-            name = token.split('=')[0].lstrip('-')
-            name = name.replace('-', '_')
-            provided.add(name)
-
     for k, v in cfg.items():
-        if v is None:
-            continue
-        # if the key was provided by CLI, skip overriding it from config
-        if k in provided:
-            continue
-        setattr(args, k, v)
+        if v is not None:
+            setattr(args, k, v)
 
     return args
-
-
-def run(args, tune_reporter=None):
-    """Run training/evaluation. If tune_reporter is provided, it will be
-    called after each evaluation step with a dict of reported metrics so Ray
-    Tune can track performance.
-    """
-    utils.init_distributed_mode(args)
-    # print("git:\n  {}\n".format(utils.get_sha()))
-
-    print(args)
-
-    device = torch.device(args.device)
-
-    # fix the seed for reproducibility
-    seed = args.seed + utils.get_rank()
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    # import pdb;pdb.set_trace()
-    model, criterion, postprocessors = build_yolos_model(args)
-    # model, criterion, postprocessors = build_model(args)
-    model.to(device)
-
-    model_without_ddp = model
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
-        model_without_ddp = model.module
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print('number of params:', n_parameters)
-
-    def build_optimizer(model, args):
-        skip = set()
-        if hasattr(model.backbone, 'no_weight_decay'):
-            skip = model.backbone.no_weight_decay()
-        head = []
-        backbone_decay = []
-        backbone_no_decay = []
-        for name, param in model.named_parameters():
-            if "backbone" not in name and param.requires_grad:
-                head.append(param)
-            if "backbone" in name and param.requires_grad:
-                if len(param.shape) == 1 or name.endswith(".bias") or name.split('.')[-1] in skip:
-                    backbone_no_decay.append(param)
-                else:
-                    backbone_decay.append(param)
-        param_dicts = [
-            {"params": head},
-            {"params": backbone_no_decay, "weight_decay": 0., "lr": args.lr},
-            {"params": backbone_decay, "lr": args.lr},
-        ]
-        optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
-                                  weight_decay=args.weight_decay)
-        return optimizer
-
-    optimizer = build_optimizer(model_without_ddp, args)
-
-    lr_scheduler, _ = create_scheduler(args, optimizer)
-    dataset_train = build_dataset(image_set='train', args=args)
-    dataset_val = build_dataset(image_set='val', args=args)
-    # import pdb;pdb.set_trace()
-    if args.distributed:
-        sampler_train = DistributedSampler(dataset_train)
-        sampler_val = DistributedSampler(dataset_val, shuffle=False)
-    else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-
-    batch_sampler_train = torch.utils.data.BatchSampler(
-        sampler_train, args.batch_size, drop_last=True)
-
-    data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
-                                   collate_fn=utils.collate_fn, num_workers=args.num_workers)
-    data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
-                                 drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers)
-
-    if args.dataset_file == "coco_panoptic":
-        # We also evaluate AP during panoptic training, on original coco DS
-        coco_val = datasets.coco.build("val", args)
-        base_ds = get_coco_api_from_dataset(coco_val)
-    else:
-        base_ds = get_coco_api_from_dataset(dataset_val)
-
-
-    output_dir = Path(args.output_dir)
-    tb_writer = None
-    if args.output_dir and utils.is_main_process():
-        (output_dir / 'tb').mkdir(parents=True, exist_ok=True)
-        tb_writer = SummaryWriter(log_dir=str(output_dir / 'tb'))
-    if args.resume:
-        if args.resume.startswith('https'):
-            checkpoint = torch.hub.load_state_dict_from_url(
-                args.resume, map_location='cpu', check_hash=True)
-        else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
-        if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            args.start_epoch = checkpoint['epoch'] + 1
-
-    if args.eval:
-        test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
-                                              data_loader_val, base_ds, device, args.output_dir,
-                                              epoch=args.start_epoch-1, tb_writer=tb_writer)
-        if args.output_dir:
-            utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
-        if tb_writer is not None:
-            tb_writer.close()
-        # If using Ray Tune, report the metric
-        if tune_reporter is not None:
-            if 'coco_eval_bbox' in test_stats and isinstance(test_stats['coco_eval_bbox'], (list, tuple)):
-                tune_reporter(mean_ap=test_stats['coco_eval_bbox'][0])
-        return test_stats
-
-    print("Start training")
-    start_time = time.time()
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            sampler_train.set_epoch(epoch)
-        train_stats = train_one_epoch(
-            model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm, tb_writer=tb_writer)
-        lr_scheduler.step(epoch)
-        if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint.pth']
-            # extra checkpoint before LR drop and every 100 epochs
-            if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 100 == 0:
-                checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model_without_ddp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    'args': args,
-                }, checkpoint_path)
-
-        test_stats, coco_evaluator = evaluate(
-            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
-            epoch=epoch, tb_writer=tb_writer
-        )
-
-        # Report to Ray Tune if requested (report mean AP when available)
-        if tune_reporter is not None:
-            if 'coco_eval_bbox' in test_stats and isinstance(test_stats['coco_eval_bbox'], (list, tuple)):
-                tune_reporter(mean_ap=test_stats['coco_eval_bbox'][0], epoch=epoch)
-
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     **{f'test_{k}': v for k, v in test_stats.items()},
-                     'epoch': epoch,
-                     'n_parameters': n_parameters}
-
-        if args.output_dir and utils.is_main_process():
-            with (output_dir / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
-
-            # for evaluation logs
-            if coco_evaluator is not None:
-                (output_dir / 'eval').mkdir(exist_ok=True)
-                if "bbox" in coco_evaluator.coco_eval:
-                    filenames = ['latest.pth']
-                    if epoch % 50 == 0:
-                        filenames.append(f'{epoch:03}.pth')
-                    for name in filenames:
-                        torch.save(coco_evaluator.coco_eval["bbox"].eval,
-                                   output_dir / "eval" / name)
-
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
-    if tb_writer is not None:
-        tb_writer.close()
-
-
 
 
 def main(args):
@@ -483,5 +293,4 @@ if __name__ == '__main__':
     args = load_config(args.config_path, args)
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    # call the refactored run() function
-    run(args)
+    main(args)
