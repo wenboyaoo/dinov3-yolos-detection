@@ -29,12 +29,11 @@ class DINOv3ViTDet(DINOv3ViTModel):
         self.gradient_checkpointing = config.use_checkpoint
         self.initializer_range = config.initializer_range
         self.num_det_token = config.num_det_token
-        self.det_tokens = self.embeddings.register_tokens
-        torch.nn.init.trunc_normal_(self.det_tokens, std=self.initializer_range)
 
         self.det_pos_embed = torch.nn.Parameter(torch.zeros(1, self.num_det_token, config.hidden_size))
         torch.nn.init.trunc_normal_(self.det_pos_embed, std=self.initializer_range)
 
+        self.embeddings.cls_token.requires_grad = False
         if config.freeze:
             for p in self.parameters():
                 p.requires_grad = False
@@ -92,7 +91,7 @@ class DINOv3ViTDet(DINOv3ViTModel):
 
     @torch.jit.ignore
     def no_weight_decay(self):
-        return {'det_pos_embed', 'embeddings.cls_token', 'embeddings.register_tokens'}
+        return {'det_pos_embed', 'embeddings.register_tokens'}
 
     def init_unloaded_parameters(self, info):
         param_dict = dict(self.named_parameters())
@@ -101,9 +100,7 @@ class DINOv3ViTDet(DINOv3ViTModel):
 
         for name in unloaded:
             if name in param_dict:
-                p = param_dict[name]
-                print(f"[init unloaded] {name} {tuple(p.shape)}")
-                torch.nn.init.trunc_normal_(p.data, std=self.config.initializer_range)
+                torch.nn.init.trunc_normal_(param_dict[name].data, std=self.config.initializer_range)
 
 
 class DINOv3Backbone(DINOv3ViTDet):
@@ -120,4 +117,3 @@ def build_dinov3(size='small', pretrained=False, pretrained_path=None, **kwargs)
         config = DINOv3ViTDetConfig.from_pretrained(DINOV3_CONFIG[size]['repo_id'], **kwargs)
         model = DINOv3Backbone(config)
     return model, DINOV3_CONFIG[size]['hidden_dim']
-
