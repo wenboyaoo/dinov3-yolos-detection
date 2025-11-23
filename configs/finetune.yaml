@@ -1,12 +1,13 @@
-lr: 3.2e-3
-lr_backbone: 3.2e-4
-batch_size: 128
+lr: 6.4e-3
+backbone_base_lr: 6.4e-4
+layer_decay: 0.65
+batch_size: 256
 weight_decay: 5.0e-4
 epochs: 50
 eval_size: 512
 clip_max_norm: 0.1
 use_checkpoint: False
-bf16: False # Enable bfloat16 mixed precision training
+bf16: True # Enable bfloat16 mixed precision training
 # scheduler
 sched: warmupcos # options: ["step", "warmupcos"]
 ## step
@@ -21,13 +22,9 @@ det_token_num: 60
 backbone: dinov3 # options: ["vanilla_vit", "dinov3"]
 backbone_size: small
 pretrained: True
-pretrained_path: # Leave blank to use the default HF repo
-unfreeze: 
-  - class_embed
-  - bbox_embed
-  - backbone.embeddings.register_tokens
-  - backbone.det_pos_embed
-  - backbone.layer.11.
+pretrained_path: # For the DINOv3 backbone, leave blank to use the default HuggingFace repo
+unfreeze:
+  - all
 ## vanilla_vit
 init_pe_size: [512,864]
 mid_pe_size: [512,864]
@@ -46,7 +43,7 @@ coco_path: data/voc2012/
 coco_panoptic_path:
 remove_difficult: False
 
-output_dir: outputs/dinov3_small/voc/freeze
+output_dir: outputs/5/
 device: cuda
 seed: 42
 resume: # resume from checkpoint

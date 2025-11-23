@@ -389,6 +389,9 @@ class VisionTransformer(nn.Module):
         else:
             x = self.forward_features(x)
             return x
+    
+    def get_blocks(self):
+        return list(self.blocks)
 
 
 def _conv_filter(state_dict, patch_size=16):

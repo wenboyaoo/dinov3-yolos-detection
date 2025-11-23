@@ -25,7 +25,8 @@ from util.scheduler import create_scheduler
 def get_args_parser():
     parser = argparse.ArgumentParser('Set YOLOS', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float)
-    parser.add_argument('--lr_backbone', default=1e-5, type=float)
+    parser.add_argument('--backbone_base_lr', default=1e-5, type=float)
+    parser.add_argument('--layer_decay', default=1, type=float)
     parser.add_argument('--batch_size', default=2, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=150, type=int)
@@ -153,13 +154,28 @@ def main(args):
     print('number of params:', n_parameters)
 
     def build_optimizer(model, args):
-        skip = set()
-        if hasattr(model.backbone, 'no_weight_decay'):
-            skip = model.backbone.no_weight_decay()
+        blocks = []
+        block_params_id = set()
+        vit_blocks = model.backbone.get_blocks()
+        num_blocks = len(vit_blocks)
+        for i, blk in enumerate(vit_blocks):
+            scale = args.layer_decay ** (num_blocks - i - 1)
+            blk_lr = args.backbone_base_lr * scale
+            block_params = []
+            for name, param in blk.named_parameters():
+                if param.requires_grad:
+                    block_params.append(param)
+                    block_params_id.add(id(param))
+            blocks.append({"params": block_params, "lr": blk_lr})
+        
+        skip = model.backbone.no_weight_decay() if hasattr(model.backbone, 'no_weight_decay') else set()
         head = []
         backbone_decay = []
         backbone_no_decay = []
         for name, param in model.named_parameters():
+            if id(param) in block_params_id:
+                continue
+
             if "backbone" not in name and param.requires_grad:
                 head.append(param)
             if "backbone" in name and param.requires_grad:
@@ -169,11 +185,15 @@ def main(args):
                     backbone_decay.append(param)
         param_dicts = [
             {"params": head},
-            {"params": backbone_no_decay, "weight_decay": 0., "lr": args.lr},
-            {"params": backbone_decay, "lr": args.lr},
+            {"params": backbone_no_decay, "weight_decay": 0., "lr": args.backbone_base_lr},
+            {"params": backbone_decay, "lr": args.backbone_base_lr},
         ]
+
+        param_dicts += blocks
+
         optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                   weight_decay=args.weight_decay)
+        
         return optimizer
 
     optimizer = build_optimizer(model_without_ddp, args)

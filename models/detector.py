@@ -44,7 +44,7 @@ class Detector(nn.Module):
             for p in self.parameters():
                 p.requires_grad = True
         else:
-            for name, p in self.backbone.named_parameters():
+            for name, p in self.named_parameters():
                 for prefix in unfreeze:
                     if name.startswith(prefix):
                         p.requires_grad = True

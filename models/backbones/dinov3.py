@@ -87,6 +87,7 @@ class DINOv3ViTDet(DINOv3ViTModel):
     def no_weight_decay(self):
         return {'det_pos_embed', 'embeddings.register_tokens'}
 
+    @torch.jit.ignore
     def init_unloaded_parameters(self, info):
         param_dict = dict(self.named_parameters())
 
@@ -100,6 +101,10 @@ class DINOv3ViTDet(DINOv3ViTModel):
 class DINOv3Backbone(DINOv3ViTDet):
     def forward(self, x):
         return super().forward(x, bool_masked_pos = None, head_mask = None).last_hidden_state[:, 1:1+self.num_det_token,:]
+    
+    def get_blocks(self):
+        return list(self.layer)
+
 
 def build_dinov3(size='small', pretrained=False, pretrained_path=None, **kwargs):
     assert size in DINOV3_CONFIG.keys(), f'Unknown model size: {size}'
