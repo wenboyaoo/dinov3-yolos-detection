@@ -1,6 +1,6 @@
 lr: 6.4e-3
 backbone_base_lr: 6.4e-4
-layer_decay: 0.65
+layer_decay: 1
 batch_size: 256
 weight_decay: 5.0e-4
 epochs: 50
@@ -19,7 +19,7 @@ warmup_epochs: 5
 decay_rate: 0.1
 # model setting
 det_token_num: 60
-backbone: dinov3 # options: ["vanilla_vit", "dinov3"]
+backbone: vanilla_vit # options: ["vanilla_vit", "dinov3"]
 backbone_size: small
 pretrained: True
 pretrained_path: # For the DINOv3 backbone, leave blank to use the default HuggingFace repo
@@ -43,7 +43,7 @@ coco_path: data/voc2012/
 coco_panoptic_path:
 remove_difficult: False
 
-output_dir: outputs/finetune
+output_dir: outputs/baseline
 device: cuda
 seed: 42
 resume: # resume from checkpoint

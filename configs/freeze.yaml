@@ -46,7 +46,7 @@ coco_path: data/voc2012/
 coco_panoptic_path:
 remove_difficult: False
 
-output_dir: outputs/0/
+output_dir: outputs/freeze
 device: cuda
 seed: 42
 resume: # resume from checkpoint
