@@ -1,8 +1,33 @@
-在原 YOLOS 实现的基础上增加对 DINOv3 backbone 的支持
-## 运行
-1. 安装依赖项
-2. 将 PASCAL VOC 2012 和 COCO 2017 数据集放到 data 目录下
-3. 运行 sh voc2coco/voc2coco.sh 生成 VOC 的 COCO 格式标注
-4. 登录 HuggingFace 以加载 DINOv3 模型；vanilla ViT 的预训练参数参考原仓库 hustvl/YOLOS
-5. 在 configs/ 目录中修改对应的配置文件
-6. 执行 torchrun main.py --config_path path/to/config/file
+# DINOv3-YOLOS Detection
+
+A experimental repo for running YOLOS object detection with a DINOv3 ViT backbone.  
+This is a lightweight fork of the original `hustvl/YOLOS` codebase, with added support for loading DINOv3 models from HuggingFace and running experiments on VOC.
+
+## Run
+
+1. Install dependencies  
+    ```
+    pip install -r requirements.txt
+    ```
+
+2. Log in to Hugging Face (required for loading the DINOv3 backbone)  
+    ```
+    huggingface-cli login
+    ```
+
+3. Prepare the dataset  
+   Place VOC or COCO-style data under `data/`.  
+   To convert VOC to COCO format:  
+    ```
+    sh voc2coco/voc2coco.sh
+    ```
+
+4. Select a configuration file  
+   For example: `configs/freeze.yaml`.  
+   Adjust dataset paths, backbone name, and other settings as needed.
+
+5. Launch training or evaluation  
+    ```
+    torchrun main.py --config_path path/to/configuration/file.yaml
+    ```
+    
