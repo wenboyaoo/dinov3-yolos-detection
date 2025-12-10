@@ -31,6 +31,8 @@ def get_args_parser():
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=150, type=int)
     parser.add_argument('--eval_size', default=800, type=int)
+    parser.add_argument('--eval_during_training', action='store_true')
+    parser.add_argument('--eval_epochs', default=1, type=int)
     
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='gradient clipping max norm')
@@ -202,6 +204,8 @@ def main(args):
     lr_scheduler, _ = create_scheduler(args, optimizer)
     dataset_train = build_dataset(image_set='train', args=args)
     dataset_val = build_dataset(image_set='val', args=args)
+    dataset_base = build_dataset(image_set='base', args=args)
+
     # import pdb;pdb.set_trace()
     if args.distributed:
         sampler_train = DistributedSampler(dataset_train)
@@ -223,7 +227,7 @@ def main(args):
         coco_val = datasets.coco.build("val", args)
         base_ds = get_coco_api_from_dataset(coco_val)
     else:
-        base_ds = get_coco_api_from_dataset(dataset_val)
+        base_ds = get_coco_api_from_dataset(dataset_base)
 
 
 
@@ -276,21 +280,23 @@ def main(args):
                     'epoch': epoch,
                     'args': args,
                 }, checkpoint_path)
-
-        test_stats, coco_evaluator = evaluate(
-            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
-            epoch=epoch, tb_writer=tb_writer
-        )
-
+        
+        
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     **{f'test_{k}': v for k, v in test_stats.items()},
-                     'epoch': epoch,
-                     'n_parameters': n_parameters}
+            'epoch': epoch,
+            'n_parameters': n_parameters}
+        
+        do_eval = ((epoch+1) % args.eval_epochs == 0) or (epoch == args.epochs -1)
+        do_eval = args.eval_during_training and do_eval
 
-        if args.output_dir and utils.is_main_process():
-            with (output_dir / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
-
+        if do_eval:
+            test_stats, coco_evaluator = evaluate(
+                model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
+                epoch=epoch, tb_writer=tb_writer
+            )
+            log_stats = {**{f'test_{k}': v for k, v in test_stats.items()},
+                        'epoch': epoch,
+                        'n_parameters': n_parameters}
             # for evaluation logs
             if coco_evaluator is not None:
                 (output_dir / 'eval').mkdir(exist_ok=True)
@@ -301,6 +307,10 @@ def main(args):
                     for name in filenames:
                         torch.save(coco_evaluator.coco_eval["bbox"].eval,
                                    output_dir / "eval" / name)
+
+        if args.output_dir and utils.is_main_process():
+            with (output_dir / "log.txt").open("a") as f:
+                f.write(json.dumps(log_stats) + "\n")
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

@@ -126,7 +126,7 @@ class ConvertCocoPolysToMask(object):
         return image, target
 
 
-def make_coco_transforms(image_set):
+def make_coco_transforms(image_set, args):
 
     normalize = T.Compose([
         T.ToTensor(),
@@ -171,9 +171,12 @@ def make_coco_transforms(image_set):
 
     if image_set == 'val':
         return T.Compose([
-            T.RandomResize([512], max_size=800),
+            T.RandomResize([args.eval_size], max_size=800),
             normalize,
         ])
+
+    if image_set == 'base':
+        return T.Compose([normalize])
 
     raise ValueError(f'unknown {image_set}')
 
@@ -184,7 +187,8 @@ def build(image_set, args):
     JSON_PATHS = {
         "train": root / f'train.json',
         "val": root / f'val.json',
+        "base": root / f'val.json'
     }
     img_folder, ann_file = root / "JPEGImages", JSON_PATHS[image_set]
-    dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms(image_set), return_masks=False)
+    dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms(image_set, args), return_masks=False)
     return dataset
