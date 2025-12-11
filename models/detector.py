@@ -14,7 +14,7 @@ from .backbones import build_backbone
 
 
 from .matcher import build_matcher
-
+from ..datasets import DATASET_CONFIGS
 
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
@@ -273,11 +273,6 @@ class PostProcess(nn.Module):
 # you should pass `num_classes` to be 2 (max_obj_id + 1).
 # For more details on this, check the following discussion
 # https://github.com/facebookresearch/detr/issues/108#issuecomment-650269223
-DATASET_CONFIGS = {
-    'coco':{'num_classes':91},
-    'coco_panoptic':{'num_classes':250}, # for panoptic, we just add a num_classes that is large enough to hold max_obj_id + 1, but the exact value doesn't really matter
-    'voc':{'num_classes':24}
-}
 
 def build(args):
     if args.dataset_file in DATASET_CONFIGS.keys():

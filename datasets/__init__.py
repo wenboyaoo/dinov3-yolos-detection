@@ -5,6 +5,11 @@ import torchvision
 from .coco import build as build_coco
 from .voc import build as build_voc
 
+DATASET_CONFIGS = {
+    'coco':{'num_classes':91},
+    'coco_panoptic':{'num_classes':250}, # for panoptic, we just add a num_classes that is large enough to hold max_obj_id + 1, but the exact value doesn't really matter
+    'voc':{'num_classes':24}
+}
 
 def get_coco_api_from_dataset(dataset):
     for _ in range(10):

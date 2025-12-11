@@ -50,6 +50,7 @@ class VOCMetric(BaseMetric):
                  proposal_nums: Sequence[int] = (100, 300, 1000),
                  eval_mode: str = '11points',
                  collect_device: str = 'cpu',
+                 num_classes: int = 24,
                  prefix: Optional[str] = None) -> None:
         super().__init__(collect_device=collect_device, prefix=prefix)
         self.iou_thrs = [iou_thrs] if isinstance(iou_thrs, float) \
@@ -68,6 +69,8 @@ class VOCMetric(BaseMetric):
         assert eval_mode in ['area', '11points'], \
             'Unrecognized mode, only "area" and "11points" are supported'
         self.eval_mode = eval_mode
+        self.dataset_meta = {}
+        self.dataset_meta['num_classes'] = num_classes
 
     # TODO: data_batch is no longer needed, consider adjusting the
     #  parameter position
@@ -98,7 +101,7 @@ class VOCMetric(BaseMetric):
             pred_labels = pred['labels'].cpu().numpy()
 
             dets = []
-            for label in range(len(self.dataset_meta['classes'])):
+            for label in range(self.dataset_meta['num_classes']):
                 index = np.where(pred_labels == label)[0]
                 pred_bbox_scores = np.hstack(
                     [pred_bboxes[index], pred_scores[index].reshape((-1, 1))])
@@ -106,7 +109,7 @@ class VOCMetric(BaseMetric):
 
             self.results.append((ann, dets))
 
-    def compute_metrics(self, results: list) -> dict:
+    def compute_metrics(self, results: list = []) -> dict:
         """Compute the metrics from processed results.
 
         Args:
@@ -116,24 +119,13 @@ class VOCMetric(BaseMetric):
             dict: The computed metrics. The keys are the names of the metrics,
             and the values are corresponding results.
         """
+        results = self.results
         logger: MMLogger = MMLogger.get_current_instance()
         gts, preds = zip(*results)
         eval_results = OrderedDict()
         if self.metric == 'mAP':
             assert isinstance(self.iou_thrs, list)
-            dataset_type = self.dataset_meta.get('dataset_type')
-            if dataset_type in ['VOC2007', 'VOC2012']:
-                dataset_name = 'voc'
-                if dataset_type == 'VOC2007' and self.eval_mode != '11points':
-                    warnings.warn('Pascal VOC2007 uses `11points` as default '
-                                  'evaluate mode, but you are using '
-                                  f'{self.eval_mode}.')
-                elif dataset_type == 'VOC2012' and self.eval_mode != 'area':
-                    warnings.warn('Pascal VOC2012 uses `area` as default '
-                                  'evaluate mode, but you are using '
-                                  f'{self.eval_mode}.')
-            else:
-                dataset_name = self.dataset_meta['classes']
+            dataset_name = 'voc'
 
             mean_aps = []
             for iou_thr in self.iou_thrs:

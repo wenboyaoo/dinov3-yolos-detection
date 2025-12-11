@@ -16,6 +16,7 @@ import datasets
 import util.misc as utils
 from datasets import build_dataset, get_coco_api_from_dataset
 from engine import evaluate, train_one_epoch
+from .datasets import DATASET_CONFIGS
 
 from models import build_model as build_yolos_model
 
@@ -290,10 +291,8 @@ def main(args):
         do_eval = args.eval_during_training and do_eval
 
         if do_eval:
-            test_stats, coco_evaluator = evaluate(
-                model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
-                epoch=epoch, tb_writer=tb_writer
-            )
+            num_classes = DATASET_CONFIGS[args.dataset_file]['num_classes']
+            test_stats, coco_evaluator = evaluate(evaluator=args.evaluator, num_classes=num_classes, model=model, criterion=criterion, postprocessors=postprocessors, data_loade=data_loader_val, base_ds=base_ds, device=device, epoch=epoch, tb_writer=tb_writer)
             log_stats = {**{f'test_{k}': v for k, v in test_stats.items()},
                         'epoch': epoch,
                         'n_parameters': n_parameters}
@@ -302,8 +301,7 @@ def main(args):
                 (output_dir / 'eval').mkdir(exist_ok=True)
                 if "bbox" in coco_evaluator.coco_eval:
                     filenames = ['latest.pth']
-                    if epoch % 50 == 0:
-                        filenames.append(f'{epoch:03}.pth')
+                    filenames.append(f'{epoch:03}.pth')
                     for name in filenames:
                         torch.save(coco_evaluator.coco_eval["bbox"].eval,
                                    output_dir / "eval" / name)

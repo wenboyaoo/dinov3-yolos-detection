@@ -12,6 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import util.misc as utils
 from datasets.coco_eval import CocoEvaluator
+from datasets.voc_metric import VOCMetric
 
 # def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 #                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -146,8 +147,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir,
-             epoch: Optional[int] = None, tb_writer: Optional[SummaryWriter] = None):
+def coco_evaluate(model, criterion, postprocessors, data_loader, base_ds, device, epoch: Optional[int] = None, tb_writer: Optional[SummaryWriter] = None, **kwargs):
     model.eval()
     criterion.eval()
 
@@ -227,3 +227,75 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
                 tb_writer.add_scalar(f'eval/mask_{name}', val, log_step)
 
     return stats, coco_evaluator
+
+@torch.no_grad()
+def voc_evaluate(model, criterion, postprocessors, data_loader, device, num_classes=24, epoch: Optional[int] = None, tb_writer: Optional[SummaryWriter] = None,**kwargs):
+    model.eval()
+    criterion.eval()
+
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
+    header = 'Test:'
+    voc_evaluator = VOCMetric(eval_mode='area', num_classes=num_classes)
+
+    for samples, targets in metric_logger.log_every(data_loader, 256, header):
+        samples = samples.to(device)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+        outputs = model(samples)
+        loss_dict = criterion(outputs, targets)
+        weight_dict = criterion.weight_dict
+
+        # reduce losses over all GPUs for logging purposes
+        loss_dict_reduced = utils.reduce_dict(loss_dict)
+        loss_dict_reduced_scaled = {k: v * weight_dict[k]
+                                    for k, v in loss_dict_reduced.items() if k in weight_dict}
+        loss_dict_reduced_unscaled = {f'{k}_unscaled': v
+                                      for k, v in loss_dict_reduced.items()}
+        metric_logger.update(loss=sum(loss_dict_reduced_scaled.values()),
+                             **loss_dict_reduced_scaled,
+                             **loss_dict_reduced_unscaled)
+        metric_logger.update(class_error=loss_dict_reduced['class_error'])
+
+        orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
+        results = postprocessors['bbox'](outputs, orig_target_sizes)
+        data_samples = [
+            {
+                'gt_instances': {
+                    'labels': t['labels'][t['iscrowd'] == 0],
+                    'bboxes': t['boxes'][t['iscrowd'] == 0],
+                },
+                'ignored_instances': {
+                    'labels': t['labels'][t['iscrowd'] == 1],
+                    'bboxes': t['boxes'][t['iscrowd'] == 1],
+                },
+                'pred_instances': {
+                    'bboxes': r['boxes'],
+                    'scores': r['scores'],
+                    'labels': r['labels'],
+                },
+            }
+            for t, r in zip(targets, results)
+        ]
+        voc_evaluator.process(data_samples=data_samples)
+    print("Averaged stats:", metric_logger)
+    stats = voc_evaluator.compute_metrics()
+    if tb_writer is not None and utils.is_main_process():
+        log_step = epoch if epoch is not None else 0
+        for k, v in stats.items():
+            if isinstance(v, (int, float)):
+                tb_writer.add_scalar(f'eval/{k}', v, log_step)
+    
+    return stats, None
+
+EVALUATOR_CONFIG = {
+    'coco': coco_evaluate,
+    'voc': voc_evaluate
+}
+
+@torch.no_grad()
+def evaluate(evaluator, **kwargs):
+    if evaluator in EVALUATOR_CONFIG.keys():
+        return EVALUATOR_CONFIG[evaluator](**kwargs)
+    else:
+        raise ValueError(f'Unknown evaluator: {evaluator}')
