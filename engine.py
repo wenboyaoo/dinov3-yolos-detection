@@ -236,7 +236,8 @@ def voc_evaluate(model, criterion, postprocessors, data_loader, device, num_clas
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     header = 'Test:'
-    voc_evaluator = VOCMetric(eval_mode='area', num_classes=num_classes)
+    cats = data_loader.coco.cats
+    voc_evaluator = VOCMetric(eval_mode='area', num_classes=num_classes, cats=cats)
 
     for samples, targets in metric_logger.log_every(data_loader, 256, header):
         samples = samples.to(device)

@@ -50,10 +50,12 @@ class VOCMetric(BaseMetric):
                  iou_thrs: Union[float, List[float]] = 0.5,
                  scale_ranges: Optional[List[tuple]] = None,
                  metric: Union[str, List[str]] = 'mAP',
-                 proposal_nums: Sequence[int] = (100, 300, 1000),
+                 proposal_nums: Sequence[int] = [100, 300, 1000],
+                 num_classes:int = 20,
                  eval_mode: str = '11points',
                  collect_device: str = 'cpu',
-                 prefix: Optional[str] = None) -> None:
+                 prefix: Optional[str] = None,
+                 cats: Optional[dict] = None) -> None:
         super().__init__(collect_device=collect_device, prefix=prefix)
         self.iou_thrs = [iou_thrs] if isinstance(iou_thrs, float) \
             else iou_thrs
@@ -71,10 +73,12 @@ class VOCMetric(BaseMetric):
         assert eval_mode in ['area', '11points'], \
             'Unrecognized mode, only "area" and "11points" are supported'
         self.eval_mode = eval_mode
+        self.num_classes = num_classes
+        self.cats = None if cats is None or len(cats)!=self.num_classes else [c['name'] for c in cats]
 
     # TODO: data_batch is no longer needed, consider adjusting the
     #  parameter position
-    def process(self, data_batch: dict, data_samples: Sequence[dict]) -> None:
+    def process(self, data_samples: Sequence[dict]) -> None:
         """Process one batch of data samples and predictions. The processed
         results should be stored in ``self.results``, which will be used to
         compute the metrics when all batches have been processed.
@@ -101,7 +105,7 @@ class VOCMetric(BaseMetric):
             pred_labels = pred['labels'].cpu().numpy()
 
             dets = []
-            for label in range(len(self.dataset_meta['classes'])):
+            for label in range(self.num_classes):
                 index = np.where(pred_labels == label)[0]
                 pred_bbox_scores = np.hstack(
                     [pred_bboxes[index], pred_scores[index].reshape((-1, 1))])
@@ -109,7 +113,7 @@ class VOCMetric(BaseMetric):
 
             self.results.append((ann, dets))
 
-    def compute_metrics(self, results: list) -> dict:
+    def compute_metrics(self, results: list=[]) -> dict:
         """Compute the metrics from processed results.
 
         Args:
@@ -119,25 +123,12 @@ class VOCMetric(BaseMetric):
             dict: The computed metrics. The keys are the names of the metrics,
             and the values are corresponding results.
         """
+        results = self.results
         logger: MMLogger = MMLogger.get_current_instance()
         gts, preds = zip(*results)
         eval_results = OrderedDict()
         if self.metric == 'mAP':
-            assert isinstance(self.iou_thrs, list)
-            dataset_type = self.dataset_meta.get('dataset_type')
-            if dataset_type in ['VOC2007', 'VOC2012']:
-                dataset_name = 'voc'
-                if dataset_type == 'VOC2007' and self.eval_mode != '11points':
-                    warnings.warn('Pascal VOC2007 uses `11points` as default '
-                                  'evaluate mode, but you are using '
-                                  f'{self.eval_mode}.')
-                elif dataset_type == 'VOC2012' and self.eval_mode != 'area':
-                    warnings.warn('Pascal VOC2012 uses `area` as default '
-                                  'evaluate mode, but you are using '
-                                  f'{self.eval_mode}.')
-            else:
-                dataset_name = self.dataset_meta['classes']
-
+            dataset_name = 'voc'
             mean_aps = []
             for iou_thr in self.iou_thrs:
                 logger.info(f'\n{"-" * 15}iou_thr: {iou_thr}{"-" * 15}')
@@ -152,6 +143,7 @@ class VOCMetric(BaseMetric):
                     scale_ranges=self.scale_ranges,
                     iou_thr=iou_thr,
                     dataset=dataset_name,
+                    cats = self.cats,
                     logger=logger,
                     eval_mode=self.eval_mode,
                     use_legacy_coordinate=True)
@@ -948,6 +940,7 @@ def eval_map(det_results,
              iou_thr=0.5,
              ioa_thr=None,
              dataset=None,
+             cats=None,
              logger=None,
              tpfp_fn=None,
              nproc=4,
@@ -1138,7 +1131,7 @@ def eval_map(det_results,
         mean_ap = np.array(aps).mean().item() if aps else 0.0
 
     print_map_summary(
-        mean_ap, eval_results, dataset, area_ranges, logger=logger)
+        mean_ap, eval_results, dataset, cats, area_ranges, logger=logger)
 
     return mean_ap, eval_results
 
@@ -1146,6 +1139,7 @@ def eval_map(det_results,
 def print_map_summary(mean_ap,
                       results,
                       dataset=None,
+                      cats=None,
                       scale_ranges=None,
                       logger=None):
     """Print mAP and results of each class.
@@ -1187,10 +1181,10 @@ def print_map_summary(mean_ap,
 
     if dataset is None:
         label_names = [str(i) for i in range(num_classes)]
-    elif is_str(dataset):
-        label_names = get_classes(dataset)
-    else:
+    elif cats is None:
         label_names = dataset
+    else:
+        label_names = cats
 
     if not isinstance(mean_ap, list):
         mean_ap = [mean_ap]
