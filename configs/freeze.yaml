@@ -47,6 +47,7 @@ giou_loss_coef: 2
 eos_coef: 0.2
 # dataset parameters
 dataset_file: voc # options: ["coco","voc"]
+num_classes: 20
 coco_path: data/voc2012/
 coco_panoptic_path:
 remove_difficult: False

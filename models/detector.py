@@ -14,7 +14,6 @@ from .backbones import build_backbone
 
 
 from .matcher import build_matcher
-from ..datasets import DATASET_CONFIGS
 
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
@@ -275,15 +274,11 @@ class PostProcess(nn.Module):
 # https://github.com/facebookresearch/detr/issues/108#issuecomment-650269223
 
 def build(args):
-    if args.dataset_file in DATASET_CONFIGS.keys():
-        num_classes = DATASET_CONFIGS[args.dataset_file]['num_classes']
-    else:
-        num_classes = 20
     device = torch.device(args.device)
-
+    
     # import pdb;pdb.set_trace()
     model = Detector(
-        num_classes=num_classes,
+        num_classes=args.num_classes + 1,
         pretrained=args.pretrained,
         pretrained_path= args.pretrained_path,
         det_token_num=args.det_token_num,
