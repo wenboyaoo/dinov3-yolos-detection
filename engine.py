@@ -229,14 +229,14 @@ def coco_evaluate(model, criterion, postprocessors, data_loader, base_ds, device
     return stats, coco_evaluator
 
 @torch.no_grad()
-def voc_evaluate(model, criterion, postprocessors, data_loader, device, epoch: Optional[int] = None, tb_writer: Optional[SummaryWriter] = None,**kwargs):
+def voc_evaluate(model, criterion, postprocessors, data_loader, base_ds, device, epoch: Optional[int] = None, tb_writer: Optional[SummaryWriter] = None,**kwargs):
     model.eval()
     criterion.eval()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     header = 'Test:'
-    cats = data_loader.coco.cats
+    cats = base_ds.cats
     voc_evaluator = VOCMetric(eval_mode='area', cats=cats)
 
     for samples, targets in metric_logger.log_every(data_loader, 256, header):

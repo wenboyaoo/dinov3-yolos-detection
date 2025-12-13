@@ -253,9 +253,7 @@ def main(args):
             args.start_epoch = checkpoint['epoch'] + 1
 
     if args.eval:
-        test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
-                                              data_loader_val, base_ds, device, args.output_dir,
-                                              epoch=args.start_epoch-1, tb_writer=tb_writer)
+        test_stats, coco_evaluator = evaluate(model=model, criterion=criterion, postprocessors=postprocessors, data_loader=data_loader_val, base_ds=base_ds, device=device, epoch=args.start_epoch-1, tb_writer=tb_writer)
         if args.output_dir:
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
         if tb_writer is not None:
@@ -294,7 +292,7 @@ def main(args):
         do_eval = args.eval_during_training and do_eval
 
         if do_eval:
-            test_stats, coco_evaluator = evaluate(evaluator=args.evaluator, model=model, criterion=criterion, postprocessors=postprocessors, data_loade=data_loader_val, base_ds=base_ds, device=device, epoch=epoch, tb_writer=tb_writer)
+            test_stats, coco_evaluator = evaluate(evaluator=args.evaluator, model=model, criterion=criterion, postprocessors=postprocessors, data_loader=data_loader_val, base_ds=base_ds, device=device, epoch=epoch, tb_writer=tb_writer)
             log_stats = {**{f'test_{k}': v for k, v in test_stats.items()},
                         'epoch': epoch,
                         'n_parameters': n_parameters}

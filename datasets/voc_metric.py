@@ -72,7 +72,7 @@ class VOCMetric(BaseMetric):
         assert eval_mode in ['area', '11points'], \
             'Unrecognized mode, only "area" and "11points" are supported'
         self.eval_mode = eval_mode
-        self.cats = None if cats is None else [c['name'] for c in cats]
+        self.cats = None if cats is None else [c['name'] for c in cats.values()]
         self.num_classes = len(cats)
 
     # TODO: data_batch is no longer needed, consider adjusting the
