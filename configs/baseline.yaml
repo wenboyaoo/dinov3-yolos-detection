@@ -49,7 +49,7 @@ eos_coef: 0.2
 # dataset parameters
 dataset_file: voc # options: ["coco","voc"]
 num_classes: 20
-coco_path: data/voc2012/
+coco_path: data/VOC2012_train_val
 coco_panoptic_path:
 remove_difficult: False
 
