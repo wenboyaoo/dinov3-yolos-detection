@@ -51,7 +51,6 @@ class VOCMetric(BaseMetric):
                  scale_ranges: Optional[List[tuple]] = None,
                  metric: Union[str, List[str]] = 'mAP',
                  proposal_nums: Sequence[int] = [100, 300, 1000],
-                 num_classes:int = 20,
                  eval_mode: str = '11points',
                  collect_device: str = 'cpu',
                  prefix: Optional[str] = None,
@@ -73,8 +72,8 @@ class VOCMetric(BaseMetric):
         assert eval_mode in ['area', '11points'], \
             'Unrecognized mode, only "area" and "11points" are supported'
         self.eval_mode = eval_mode
-        self.num_classes = num_classes
-        self.cats = None if cats is None or len(cats)!=self.num_classes else [c['name'] for c in cats]
+        self.cats = None if cats is None else [c['name'] for c in cats]
+        self.num_classes = len(cats)
 
     # TODO: data_batch is no longer needed, consider adjusting the
     #  parameter position
