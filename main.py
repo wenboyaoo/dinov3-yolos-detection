@@ -6,6 +6,7 @@ import yaml
 import random
 import time
 from pathlib import Path
+import sys
 
 import numpy as np
 import torch
@@ -122,15 +123,17 @@ def get_args_parser():
     return parser
 
 
-def load_config(path, args):
+def load_config(path, args, cli_args):
     if path is None:
         return args
+    
     with open(path, 'r') as f:
         cfg = yaml.safe_load(f) or {}
+    
     for k, v in cfg.items():
-        if v is not None:
+        if v is not None and k not in cli_args:
             setattr(args, k, v)
-
+    
     return args
 
 
@@ -253,9 +256,9 @@ def main(args):
             args.start_epoch = checkpoint['epoch'] + 1
 
     if args.eval:
-        test_stats, coco_evaluator = evaluate(model=model, criterion=criterion, postprocessors=postprocessors, data_loader=data_loader_val, base_ds=base_ds, device=device, epoch=args.start_epoch-1, tb_writer=tb_writer)
-        if args.output_dir:
-            utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
+        test_stats, evaluator_obj = evaluate(evaluator=args.evaluator, model=model, criterion=criterion, postprocessors=postprocessors, data_loader=data_loader_val, base_ds=base_ds, device=device, epoch=args.start_epoch-1, tb_writer=tb_writer)
+        if args.output_dir and args.evaluator == 'coco' and evaluator_obj is not None:
+            utils.save_on_master(evaluator_obj.coco_eval["bbox"].eval, output_dir / "eval.pth")
         if tb_writer is not None:
             tb_writer.close()
         return
@@ -288,22 +291,21 @@ def main(args):
             'epoch': epoch,
             'n_parameters': n_parameters}
         
-        do_eval = ((epoch+1) % args.eval_epochs == 0) or (epoch == args.epochs -1)
-        do_eval = args.eval_during_training and do_eval
+        do_eval = args.eval_during_training and ((epoch + 1) % args.eval_epochs == 0 or (epoch + 1) == args.epochs)
 
         if do_eval:
-            test_stats, coco_evaluator = evaluate(evaluator=args.evaluator, model=model, criterion=criterion, postprocessors=postprocessors, data_loader=data_loader_val, base_ds=base_ds, device=device, epoch=epoch, tb_writer=tb_writer)
+            test_stats, evaluator_obj = evaluate(evaluator=args.evaluator, model=model, criterion=criterion, postprocessors=postprocessors, data_loader=data_loader_val, base_ds=base_ds, device=device, epoch=epoch, tb_writer=tb_writer)
             log_stats = {**{f'test_{k}': v for k, v in test_stats.items()},
                         'epoch': epoch,
                         'n_parameters': n_parameters}
-            # for evaluation logs
-            if coco_evaluator is not None:
+            # for COCO evaluation logs
+            if args.evaluator == 'coco' and evaluator_obj is not None:
                 (output_dir / 'eval').mkdir(exist_ok=True)
-                if "bbox" in coco_evaluator.coco_eval:
+                if "bbox" in evaluator_obj.coco_eval:
                     filenames = ['latest.pth']
                     filenames.append(f'{epoch:03}.pth')
                     for name in filenames:
-                        torch.save(coco_evaluator.coco_eval["bbox"].eval,
+                        torch.save(evaluator_obj.coco_eval["bbox"].eval,
                                    output_dir / "eval" / name)
 
         if args.output_dir and utils.is_main_process():
@@ -320,7 +322,12 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('YOLOS training and evaluation script', parents=[get_args_parser()])
     args = parser.parse_args()
-    args = load_config(args.config_path, args)
+    
+    cli_args = set(arg.lstrip('-').replace('-', '_') 
+                   for arg in sys.argv[1:] 
+                   if arg.startswith('-') and not arg.startswith('--config_path'))
+    
+    args = load_config(args.config_path, args, cli_args)
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)

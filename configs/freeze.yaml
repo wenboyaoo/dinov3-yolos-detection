@@ -11,7 +11,6 @@ bf16: True # Enable bfloat16 mixed precision training
 evaluator: voc # options: ["coco","voc"]
 eval_during_training: True
 eval_epochs: 10
-## coco evaluator
 eval_size: 512
 ## voc evaluator
 metric: mAP # options: ['mAP', 'recall']

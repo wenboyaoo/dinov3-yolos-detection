@@ -11,7 +11,6 @@ bf16: True # Enable bfloat16 mixed precision training
 evaluator: voc # options: ["coco","voc"]
 eval_during_training: True
 eval_epochs: 10
-## coco evaluator
 eval_size: 512
 ## voc evaluator
 metric: mAP # options: ['mAP', 'recall']
@@ -59,7 +58,7 @@ seed: 42
 resume: # resume from checkpoint
 start_epoch: 0
 eval: False
-num_workers: 64
+num_workers: 224
 # distributed training parameters
 world_size: 1
 dist_url: env://

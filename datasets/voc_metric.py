@@ -106,8 +106,11 @@ class VOCMetric(BaseMetric):
             dets = []
             for label in range(self.num_classes):
                 index = np.where(pred_labels == label)[0]
-                pred_bbox_scores = np.hstack(
-                    [pred_bboxes[index], pred_scores[index].reshape((-1, 1))])
+                if len(index) > 0:
+                    pred_bbox_scores = np.hstack(
+                        [pred_bboxes[index], pred_scores[index].reshape((-1, 1))])
+                else:
+                    pred_bbox_scores = np.zeros((0, 5), dtype=np.float32)
                 dets.append(pred_bbox_scores)
 
             self.results.append((ann, dets))
@@ -1082,12 +1085,16 @@ def eval_map(det_results,
                 for k, (min_area, max_area) in enumerate(area_ranges):
                     num_gts[k] += np.sum((gt_areas >= min_area)
                                          & (gt_areas < max_area))
-        # sort all det bboxes by score, also sort tp and fp
-        cls_dets = np.vstack(cls_dets)
-        num_dets = cls_dets.shape[0]
-        sort_inds = np.argsort(-cls_dets[:, -1])
-        tp = np.hstack(tp)[:, sort_inds]
-        fp = np.hstack(fp)[:, sort_inds]
+        if len(cls_dets) > 0 and cls_dets[0].shape[0] > 0:
+            cls_dets = np.vstack(cls_dets)
+            num_dets = cls_dets.shape[0]
+            sort_inds = np.argsort(-cls_dets[:, -1])
+            tp = np.hstack(tp)[:, sort_inds]
+            fp = np.hstack(fp)[:, sort_inds]
+        else:
+            num_dets = 0
+            tp = np.hstack(tp) if len(tp) > 0 else np.zeros((num_scales, 0), dtype=np.float32)
+            fp = np.hstack(fp) if len(fp) > 0 else np.zeros((num_scales, 0), dtype=np.float32)
         # calculate recall and precision with tp and fp
         tp = np.cumsum(tp, axis=1)
         fp = np.cumsum(fp, axis=1)

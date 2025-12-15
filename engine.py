@@ -11,6 +11,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 import util.misc as utils
+from util import box_ops
 from datasets.coco_eval import CocoEvaluator
 from datasets.voc_metric import VOCMetric
 
@@ -237,7 +238,8 @@ def voc_evaluate(model, criterion, postprocessors, data_loader, base_ds, device,
     metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     header = 'Test:'
     cats = base_ds.cats
-    voc_evaluator = VOCMetric(eval_mode='area', cats=cats)
+    cats_0based = {(cat_id - 1): cat_info for cat_id, cat_info in cats.items()}
+    voc_evaluator = VOCMetric(eval_mode='area', cats=cats_0based)
 
     for samples, targets in metric_logger.log_every(data_loader, 256, header):
         samples = samples.to(device)
@@ -260,24 +262,44 @@ def voc_evaluate(model, criterion, postprocessors, data_loader, base_ds, device,
 
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
         results = postprocessors['bbox'](outputs, orig_target_sizes)
-        data_samples = [
-            {
+        
+        data_samples = []
+        for t, r in zip(targets, results):
+            fg = (t['iscrowd'] == 0) & (t['labels'] <= 20)
+            ig = (t['iscrowd'] == 1) & (t['labels'] <= 20)
+            pr = (r['labels'] < 20)
+
+            orig_h, orig_w = t['orig_size']
+            
+            gt_boxes_fg = t['boxes'][fg].clone()
+            gt_boxes_fg[:, 0::2] *= orig_w
+            gt_boxes_fg[:, 1::2] *= orig_h
+            gt_boxes_fg = box_ops.box_cxcywh_to_xyxy(gt_boxes_fg)  # [cx,cy,w,h] -> [x0,y0,x1,y1]
+            
+            gt_boxes_ig = t['boxes'][ig].clone()
+            if gt_boxes_ig.shape[0] > 0:
+                gt_boxes_ig[:, 0::2] *= orig_w
+                gt_boxes_ig[:, 1::2] *= orig_h
+                gt_boxes_ig = box_ops.box_cxcywh_to_xyxy(gt_boxes_ig)
+
+            gt_labels_fg = t['labels'][fg] - 1
+            gt_labels_ig = t['labels'][ig] - 1
+            pred_labels = r['labels'][pr] - 1  
+            data_samples.append({
                 'gt_instances': {
-                    'labels': t['labels'][t['iscrowd'] == 0],
-                    'bboxes': t['boxes'][t['iscrowd'] == 0],
+                    'labels': gt_labels_fg,
+                    'bboxes': gt_boxes_fg,
                 },
                 'ignored_instances': {
-                    'labels': t['labels'][t['iscrowd'] == 1],
-                    'bboxes': t['boxes'][t['iscrowd'] == 1],
+                    'labels': gt_labels_ig,
+                    'bboxes': gt_boxes_ig,
                 },
                 'pred_instances': {
-                    'bboxes': r['boxes'],
-                    'scores': r['scores'],
-                    'labels': r['labels'],
+                    'bboxes': r['boxes'][pr],
+                    'scores': r['scores'][pr],
+                    'labels': pred_labels,
                 },
-            }
-            for t, r in zip(targets, results)
-        ]
+            })
         voc_evaluator.process(data_samples=data_samples)
     print("Averaged stats:", metric_logger)
     stats = voc_evaluator.compute_metrics()
