@@ -8,14 +8,9 @@ clip_max_norm: 0.1
 use_checkpoint: False
 bf16: True # Enable bfloat16 mixed precision training
 # evaluation
-evaluator: voc # options: ["coco","voc"]
 eval_during_training: True
 eval_epochs: 10
 eval_size: 512
-## voc evaluator
-metric: mAP # options: ['mAP', 'recall']
-proposal_nums: [100, 300, 1000]
-eval_mode: area # options: ['area, '11points']
 # scheduler
 sched: warmupcos # options: ["step", "warmupcos"]
 ## step
