@@ -1,7 +1,14 @@
 # DINOv3-YOLOS Detection
 
-A experimental repo for running YOLOS object detection with a DINOv3 ViT backbone.  
-This is a lightweight fork of the original `hustvl/YOLOS` codebase, with added support for loading DINOv3 models from HuggingFace and running experiments on VOC.
+An experimental fork of the original NeurIPS 2021 YOLOS repository that adds support for loading DINOv3 ViT backbones from Hugging Face, enabling an evaluation of how DINOv3 features transfer to object detection when adapted to a YOLOS-style pipeline. The repository also includes several experiment-friendly utilities to facilitate running and reproducing experiments.
+
+## Performance
+- Dataset: PASCAL VOC 2012
+- Training: 75 epochs
+- Config: `configs/finetune.yaml`
+- Metric: mAP@0.5 (validation)
+
+Result: mAP@0.5 = 0.66
 
 ## Run
 
@@ -16,7 +23,7 @@ This is a lightweight fork of the original `hustvl/YOLOS` codebase, with added s
     ```
 
 3. Prepare the dataset  
-   Place VOC or COCO-style data under `data/`.  
+   Place  COCO-style data under `data/`.  
    To convert VOC to COCO format:  
     ```
     sh voc2coco/voc2coco.sh
