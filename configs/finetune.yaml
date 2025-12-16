@@ -1,15 +1,15 @@
-lr: 6.4e-3
-backbone_base_lr: 6.4e-4
-layer_decay: 0.65
-batch_size: 256
+lr: 8.0e-4
+backbone_base_lr: 8.0e-5
+layer_decay: 1
+batch_size: 32
 weight_decay: 5.0e-4
-epochs: 50
+epochs: 75
 clip_max_norm: 0.1
 use_checkpoint: False
 bf16: True # Enable bfloat16 mixed precision training
 # evaluation
 eval_during_training: True
-eval_epochs: 10
+eval_epochs: 5
 eval_size: 512
 # scheduler
 sched: warmupcos # options: ["step", "warmupcos"]
@@ -53,7 +53,7 @@ seed: 42
 resume: # resume from checkpoint
 start_epoch: 0
 eval: False
-num_workers: 224
+num_workers: 100
 # distributed training parameters
 world_size: 1
 dist_url: env://

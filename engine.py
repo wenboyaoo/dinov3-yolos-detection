@@ -13,7 +13,6 @@ from torch.utils.tensorboard import SummaryWriter
 import util.misc as utils
 from util import box_ops
 from datasets.coco_eval import CocoEvaluator
-from datasets.voc_metric import VOCMetric
 
 # def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 #                     data_loader: Iterable, optimizer: torch.optim.Optimizer,

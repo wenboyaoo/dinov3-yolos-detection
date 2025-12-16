@@ -1,15 +1,15 @@
-lr: 6.4e-3
-backbone_base_lr: 6.4e-4
+lr: 8.0e-4
+backbone_base_lr: 8.0e-5
 layer_decay: 1
-batch_size: 256
+batch_size: 32
 weight_decay: 5.0e-4
-epochs: 50
+epochs: 75
 clip_max_norm: 0.1
 use_checkpoint: False
 bf16: True # Enable bfloat16 mixed precision training
 # evaluation
 eval_during_training: True
-eval_epochs: 10
+eval_epochs: 5
 eval_size: 512
 # scheduler
 sched: warmupcos # options: ["step", "warmupcos"]
@@ -21,11 +21,11 @@ min_lr: 1.0e-6
 warmup_epochs: 5
 decay_rate: 0.1
 # model setting
-det_token_num: 60
+det_token_num: 100
 backbone: vanilla_vit # options: ["vanilla_vit", "dinov3"]
 backbone_size: small
 pretrained: True
-pretrained_path: # For the DINOv3 backbone, leave blank to use the default HuggingFace repo
+pretrained_path: pretrained/deit_s_width_200.pth # For the DINOv3 backbone, leave blank to use the default HuggingFace repo
 unfreeze:
   - all
 ## vanilla_vit
@@ -53,7 +53,7 @@ seed: 42
 resume: # resume from checkpoint
 start_epoch: 0
 eval: False
-num_workers: 224
+num_workers: 128
 # distributed training parameters
 world_size: 1
 dist_url: env://
