@@ -36,7 +36,7 @@ set_cost_class: 4
 set_cost_bbox: 5
 set_cost_giou: 2
 # Loss coefficients
-dice_loss_coef: 1
+ce_loss_coef: 4
 bbox_loss_coef: 5
 giou_loss_coef: 2
 eos_coef: 0.2
