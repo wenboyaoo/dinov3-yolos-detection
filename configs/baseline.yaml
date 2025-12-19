@@ -32,11 +32,11 @@ unfreeze:
 init_pe_size: [512,864]
 mid_pe_size: [512,864]
 # Matcher
-set_cost_class: 4
+set_cost_class: 1
 set_cost_bbox: 5
 set_cost_giou: 2
 # Loss coefficients
-ce_loss_coef: 4
+ce_loss_coef: 1
 bbox_loss_coef: 5
 giou_loss_coef: 2
 eos_coef: 0.2
