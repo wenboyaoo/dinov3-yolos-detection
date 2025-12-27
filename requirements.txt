@@ -20,9 +20,6 @@ tqdm
 # Detection / evaluation
 pycocotools
 submitit
-mmengine
-mmdet
-mmcv>=2.0.0rc4, <2.2.0
 
 # Visualization / logging
 tensorboard>=2.0

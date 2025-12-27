@@ -26,30 +26,25 @@ from util.scheduler import create_scheduler
 def get_args_parser():
     parser = argparse.ArgumentParser('Set YOLOS', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float)
-    parser.add_argument('--backbone_base_lr', default=1e-5, type=float)
-    parser.add_argument('--layer_decay', default=1, type=float)
-    parser.add_argument('--batch_size', default=2, type=int)
-    parser.add_argument('--weight_decay', default=1e-4, type=float)
+    parser.add_argument('--backbone-lr', default=1e-5, type=float)
+    parser.add_argument('--layer-decay', default=1, type=float)
+    parser.add_argument('--batch-size', default=2, type=int)
+    parser.add_argument('--weight-decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=150, type=int)
-    parser.add_argument('--evaluator', default='coco', type=str)
-    parser.add_argument('--metric', default='mAP', type=str)
-    parser.add_argument('--proposal_nums', default=[100, 300, 1000], nargs='+', type=int)
-    parser.add_argument('--eval_mode', default='area', type=str)
-    parser.add_argument('--eval_size', default=800, type=int)
-    parser.add_argument('--eval_during_training', action='store_true')
-    parser.add_argument('--eval_epochs', default=1, type=int)
-    
-    parser.add_argument('--clip_max_norm', default=0.1, type=float,
+    parser.add_argument('--clip-max-norm', default=0.1, type=float,
                         help='gradient clipping max norm')
-
-    parser.add_argument('--use_checkpoint', action='store_true',
+    parser.add_argument('--use-checkpoint', action='store_true',
                         help='use checkpoint.checkpoint to save mem')
+    parser.add_argument('--evaluator', default='coco', type=str)
+    parser.add_argument('--eval-size', default=800, type=int)
+    parser.add_argument('--eval-during-training', action='store_true')
+    parser.add_argument('--eval-epochs', default=1, type=int)
     # scheduler
     # Learning rate schedule parameters
     parser.add_argument('--sched', default='warmupcos', type=str, metavar='SCHEDULER',
                         help='LR scheduler (default: "step", options:"step", "warmupcos"')
     ## step
-    parser.add_argument('--lr_drop', default=100, type=int)  
+    parser.add_argument('--lr-drop', default=100, type=int)  
     ## warmupcosine
 
     # parser.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
@@ -68,57 +63,53 @@ def get_args_parser():
                         help='LR decay rate (default: 0.1)')
 
     # * model setting
-    parser.add_argument('--det_token_num', default=100, type=int,
+    parser.add_argument('--num-det-token', default=100, type=int,
                         help="Number of det token in the deit backbone")
     parser.add_argument('--backbone', default='dinov3', type=str,
                         help="Name of the backbone to use"),
-    parser.add_argument('--backbone_size', default='dinov3', type=str,
+    parser.add_argument('--backbone-size', default='dinov3', type=str,
                         help="Size of the backbone to use"),
-    parser.add_argument('--unfreeze', nargs='+', default=[], help="list of prefix to unfreeze"),
-    parser.add_argument('--pretrained',action="store_true"),
-    parser.add_argument('--pretrained_path', default= None),
-    parser.add_argument('--init_pe_size', nargs='+', type=int,
+    parser.add_argument('--unfreeze', nargs='+', default=[]),
+    parser.add_argument('--no-weight-decay', nargs='+', default=[]),
+    parser.add_argument('--pretrained-path', default= None),
+    parser.add_argument('--init-pe-size', nargs='+', type=int,
                         help="init pe size (h,w)")
-    parser.add_argument('--mid_pe_size', nargs='+', type=int,
+    parser.add_argument('--mid-pe-size', nargs='+', type=int,
                         help="mid pe size (h,w)")
     # * Matcher
-    parser.add_argument('--set_cost_class', default=1, type=float,
+    parser.add_argument('--set-cost-class', default=1, type=float,
                         help="Class coefficient in the matching cost")
-    parser.add_argument('--set_cost_bbox', default=5, type=float,
+    parser.add_argument('--set-cost-bbox', default=5, type=float,
                         help="L1 box coefficient in the matching cost")
-    parser.add_argument('--set_cost_giou', default=2, type=float,
+    parser.add_argument('--set-cost-giou', default=2, type=float,
                         help="giou box coefficient in the matching cost")
     # * Loss coefficients
-    parser.add_argument('--ce_loss_coef', default=1, type=float)
-    parser.add_argument('--bbox_loss_coef', default=5, type=float)
-    parser.add_argument('--giou_loss_coef', default=2, type=float)
-    parser.add_argument('--eos_coef', default=0.1, type=float,
+    parser.add_argument('--ce-loss-coef', default=1, type=float)
+    parser.add_argument('--bbox-loss-coef', default=5, type=float)
+    parser.add_argument('--giou-loss-coef', default=2, type=float)
+    parser.add_argument('--eos-coef', default=0.1, type=float,
                         help="Relative classification weight of the no-object class")
 
     # dataset parameters
-    parser.add_argument('--dataset_file', default='coco')
-    parser.add_argument('--coco_path', type=str)
-    parser.add_argument('--coco_panoptic_path', type=str)
-    parser.add_argument('--remove_difficult', action='store_true')
+    parser.add_argument('--dataset-file', default='coco')
+    parser.add_argument('--coco-path', type=str)
+    parser.add_argument('--remove-difficult', action='store_true')
 
-    parser.add_argument('--output_dir', default='',
+    parser.add_argument('--output-dir', default='',
                         help='path where to save, empty for no saving')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=42, type=int)
+    parser.add_argument('--save-epochs', default=10, type=int)
     parser.add_argument('--resume', default='', help='resume from checkpoint')
-    parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
+    parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
-    parser.add_argument('--num_workers', default=2, type=int)
+    parser.add_argument('--num-workers', default=2, type=int)
     parser.add_argument('--bf16', action='store_true',
                         help='Enable bfloat16 mixed precision training')
 
-    # distributed training parameters
-    parser.add_argument('--world_size', default=1, type=int,
-                        help='number of distributed processes')
-    parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
-    parser.add_argument('--config_path',default=None, help='path to .yaml configuration file')
+    parser.add_argument('--config-path',default=None, help='path to .yaml configuration file')
     return parser
 
 
@@ -137,11 +128,11 @@ def load_config(path, args, cli_args):
 
 
 def main(args):
-    utils.init_distributed_mode(args)
     # print("git:\n  {}\n".format(utils.get_sha()))
-
-    print(args)
-
+    print("Arguments:")
+    for k, v in vars(args).items():
+        print(f"  {k}: {v}")
+    print()
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
@@ -153,37 +144,15 @@ def main(args):
     model, criterion, postprocessors = build_yolos_model(args)
     # model, criterion, postprocessors = build_model(args)
     model.to(device)
-
-    model_without_ddp = model
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu],find_unused_parameters=True)
-        model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
     def build_optimizer(model, args):
-        blocks = []
-        block_params_id = set()
-        vit_blocks = model.backbone.get_blocks()
-        num_blocks = len(vit_blocks)
-        for i, blk in enumerate(vit_blocks):
-            scale = args.layer_decay ** (num_blocks - i - 1)
-            blk_lr = args.backbone_base_lr * scale
-            block_params = []
-            for name, param in blk.named_parameters():
-                if param.requires_grad:
-                    block_params.append(param)
-                    block_params_id.add(id(param))
-            blocks.append({"params": block_params, "lr": blk_lr})
-        
-        skip = model.backbone.no_weight_decay() if hasattr(model.backbone, 'no_weight_decay') else set()
+        skip = args.no_weight_decay
         head = []
         backbone_decay = []
         backbone_no_decay = []
         for name, param in model.named_parameters():
-            if id(param) in block_params_id:
-                continue
-
             if "backbone" not in name and param.requires_grad:
                 head.append(param)
             if "backbone" in name and param.requires_grad:
@@ -193,18 +162,14 @@ def main(args):
                     backbone_decay.append(param)
         param_dicts = [
             {"params": head},
-            {"params": backbone_no_decay, "weight_decay": 0., "lr": args.backbone_base_lr},
-            {"params": backbone_decay, "lr": args.backbone_base_lr},
+            {"params": backbone_no_decay, "weight_decay": 0., "lr": args.backbone_lr},
+            {"params": backbone_decay, "lr": args.backbone_lr},
         ]
-
-        param_dicts += blocks
-
         optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                   weight_decay=args.weight_decay)
-        
         return optimizer
 
-    optimizer = build_optimizer(model_without_ddp, args)
+    optimizer = build_optimizer(model, args)
 
 
     lr_scheduler, _ = create_scheduler(args, optimizer)
@@ -213,12 +178,8 @@ def main(args):
     dataset_base = build_dataset(image_set='base', args=args)
 
     # import pdb;pdb.set_trace()
-    if args.distributed:
-        sampler_train = DistributedSampler(dataset_train)
-        sampler_val = DistributedSampler(dataset_val, shuffle=False)
-    else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+    sampler_train = torch.utils.data.RandomSampler(dataset_train)
+    sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
     batch_sampler_train = torch.utils.data.BatchSampler(
         sampler_train, args.batch_size, drop_last=True)
@@ -228,27 +189,18 @@ def main(args):
     data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
                                  drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers)
 
-    if args.dataset_file == "coco_panoptic":
-        # We also evaluate AP during panoptic training, on original coco DS
-        coco_val = datasets.coco.build("val", args)
-        base_ds = get_coco_api_from_dataset(coco_val)
-    else:
-        base_ds = get_coco_api_from_dataset(dataset_base)
-
+    base_ds = get_coco_api_from_dataset(dataset_base)
 
 
     output_dir = Path(args.output_dir)
     tb_writer = None
     if args.output_dir and utils.is_main_process():
-        (output_dir / 'tb').mkdir(parents=True, exist_ok=True)
-        tb_writer = SummaryWriter(log_dir=str(output_dir / 'tb'))
+        (output_dir / 'tensorboard').mkdir(parents=True, exist_ok=True)
+        tb_writer = SummaryWriter(log_dir=str(output_dir / 'tensorboard'))
+
     if args.resume:
-        if args.resume.startswith('https'):
-            checkpoint = torch.hub.load_state_dict_from_url(
-                args.resume, map_location='cpu', check_hash=True)
-        else:
-            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-        model_without_ddp.load_state_dict(checkpoint['model'])
+        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+        model.load_state_dict(checkpoint['model'])
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
@@ -265,8 +217,6 @@ def main(args):
     print("Start training")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
             args.clip_max_norm, tb_writer=tb_writer, use_bf16=args.bf16)
@@ -274,11 +224,11 @@ def main(args):
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
             # extra checkpoint before LR drop and every 100 epochs
-            if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 100 == 0:
+            if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % args.save_epochs == 0:
                 checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
             for checkpoint_path in checkpoint_paths:
                 utils.save_on_master({
-                    'model': model_without_ddp.state_dict(),
+                    'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
                     'epoch': epoch,
@@ -291,7 +241,6 @@ def main(args):
             'n_parameters': n_parameters}
         
         do_eval = args.eval_during_training and ((epoch + 1) % args.eval_epochs == 0 or (epoch + 1) == args.epochs)
-
         if do_eval:
             test_stats, evaluator_obj = evaluate(evaluator=args.evaluator, model=model, criterion=criterion, postprocessors=postprocessors, data_loader=data_loader_val, base_ds=base_ds, device=device, epoch=epoch, tb_writer=tb_writer)
             log_stats = {**{f'test_{k}': v for k, v in test_stats.items()},

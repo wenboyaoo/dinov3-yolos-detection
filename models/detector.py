@@ -30,13 +30,13 @@ class MLP(nn.Module):
         return x
 
 class Detector(nn.Module):
-    def __init__(self, num_classes, pretrained=False, pretrained_path=None, unfreeze=None, det_token_num=100, backbone='dinov3', backbone_size='small', use_checkpoint=False):
+    def __init__(self, args):
         super().__init__()
         # import pdb;pdb.set_trace()
-        self.backbone, hidden_dim = build_backbone(backbone=backbone, size=backbone_size, pretrained=pretrained, pretrained_path=pretrained_path, num_det_token=det_token_num, use_checkpoint=use_checkpoint)
-        self.class_embed = MLP(hidden_dim, hidden_dim, num_classes + 1, 3)
+        self.backbone, hidden_dim = build_backbone(**vars(args))
+        self.class_embed = MLP(hidden_dim, hidden_dim, args.num_classes, 3)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
-        unfreeze = [] if unfreeze is None else unfreeze
+        unfreeze = [] if args.unfreeze is None else args.unfreeze
         for name, p in self.backbone.named_parameters():
             p.requires_grad = False
         if 'all' in unfreeze:
@@ -274,19 +274,11 @@ class PostProcess(nn.Module):
 # https://github.com/facebookresearch/detr/issues/108#issuecomment-650269223
 
 def build(args):
+    if hasattr(args, 'num_classes'):
+        args.num_classes = args.num_classes+1 
     device = torch.device(args.device)
-    
     # import pdb;pdb.set_trace()
-    model = Detector(
-        num_classes=args.num_classes + 1,
-        pretrained=args.pretrained,
-        pretrained_path= args.pretrained_path,
-        det_token_num=args.det_token_num,
-        backbone=args.backbone,
-        backbone_size=args.backbone_size,
-        unfreeze=args.unfreeze,
-        use_checkpoint=args.use_checkpoint
-    )
+    model = Detector(args)
     matcher = build_matcher(args)
     weight_dict = {'loss_ce': args.ce_loss_coef, 'loss_bbox': args.bbox_loss_coef, 'loss_giou':args.giou_loss_coef}
     # TODO this is a hack

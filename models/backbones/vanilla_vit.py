@@ -141,7 +141,7 @@ class VisionTransformer(nn.Module):
     """
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm, is_distill=False):
+                 drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm, is_distill=False, **kwargs):
         super().__init__()
         
         if isinstance(img_size,tuple):
@@ -241,12 +241,6 @@ class VisionTransformer(nn.Module):
             self.has_mid_pe = True
             self.mid_pe_size = mid_pe_size
         self.use_checkpoint=use_checkpoint
-
-
-
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        return {'pos_embed', 'cls_token', 'det_token'}
 
     def get_classifier(self):
         return self.head
@@ -381,6 +375,45 @@ class VisionTransformer(nn.Module):
 
         return output
 
+    def get_attentions(self, x):
+        # import pdb;pdb.set_trace()
+        B, H, W = x.shape[0], x.shape[2], x.shape[3]
+        # if (H,W) != self.img_size:
+        #     self.finetune = True
+
+        x = self.patch_embed(x)
+        # interpolate init pe
+        if (self.pos_embed.shape[1] - 1 - self.det_token_num) != x.shape[1]:
+            temp_pos_embed = self.InterpolateInitPosEmbed(self.pos_embed, img_size=(H,W))
+        else:
+            temp_pos_embed = self.pos_embed
+        # interpolate mid pe
+        if self.has_mid_pe:
+            # temp_mid_pos_embed = []
+            if (self.mid_pos_embed.shape[2] - 1 - self.det_token_num) != x.shape[1]:
+                temp_mid_pos_embed = self.InterpolateMidPosEmbed(self.mid_pos_embed, img_size=(H,W))
+            else:
+                temp_mid_pos_embed = self.mid_pos_embed
+
+
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
+        det_token = self.det_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x, det_token), dim=1)
+        x = x + temp_pos_embed
+        x = self.pos_drop(x)
+        output = []
+        for i in range(len((self.blocks))):
+            if self.use_checkpoint:
+                x = checkpoint.checkpoint(self.blocks[i], x)    # saves mem, takes time
+            else:
+                x, attn = self.blocks[i](x, return_attention=True)
+
+            
+            output.append(attn)
+            if self.has_mid_pe:
+                if i < (self.depth - 1):
+                    x = x + temp_mid_pos_embed[i]
+        return torch.stack(output)
 
     def forward(self, x, return_attention=False):
         if return_attention == True:
@@ -466,15 +499,10 @@ VANILLA_VIT_CONFIG = {
     'base':{'builder':base, 'hidden_dim':768}
 }
 
-def build_vanilla_vit(size='small', pretrained=False, pretrained_path=None, num_det_token=100, use_checkpoint=False, init_pe_size=[800,1344], mid_pe_size =[800,1344],**kwargs):
+def build_vanilla_vit(size='small', pretrained=False, num_det_token=100, use_checkpoint=False, init_pe_size=[800,1344], mid_pe_size =[800,1344],**kwargs):
     assert size in VANILLA_VIT_CONFIG.keys(), f'Unknown model size: {size}'
-    assert (not pretrained) or pretrained_path, f'If pretrained is set to True, you must specify a valid pretrained_path'
 
     builder =  VANILLA_VIT_CONFIG[size]['builder']
-    if pretrained:
-        model = builder(pretrained=pretrained_path, **kwargs)
-    else:
-        model = builder(pretrained=None, **kwargs)
+    model = builder(pretrained=pretrained, **kwargs)
     model.finetune_det(det_token_num=num_det_token, img_size=init_pe_size, mid_pe_size=mid_pe_size, use_checkpoint=use_checkpoint)
     return model, VANILLA_VIT_CONFIG[size]['hidden_dim']
-

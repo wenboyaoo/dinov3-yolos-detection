@@ -1,16 +1,16 @@
 lr: 8.0e-4
-backbone_base_lr: 8.0e-5
+backbone_lr: 8.0e-5
 layer_decay: 1
 batch_size: 32
 weight_decay: 5.0e-4
 epochs: 75
 clip_max_norm: 0.1
-use_checkpoint: False
-bf16: True # Enable bfloat16 mixed precision training
-# evaluation
+bf16: True
 eval_during_training: True
 eval_epochs: 5
 eval_size: 512
+save_epochs: 10
+
 # scheduler
 sched: warmupcos # options: ["step", "warmupcos"]
 ## step
@@ -20,40 +20,43 @@ warmup_lr: 1.0e-6
 min_lr: 1.0e-6
 warmup_epochs: 5
 decay_rate: 0.1
-# model setting
-det_token_num: 100
+
+# model settings
+num_det_token: 100
 backbone: vanilla_vit # options: ["vanilla_vit", "dinov3"]
 backbone_size: small
-pretrained: True
-pretrained_path: pretrained/deit_s_width_200.pth # For the DINOv3 backbone, leave blank to use the default HuggingFace repo
+pretrained_path: pretrained/deit_s_width_200.pth
 unfreeze:
   - all
+no_weight_decay:
+  - pos_embed
+  - cls_token
+  - det_token
 ## vanilla_vit
+backbone_size: small
+use_checkpoint: False
 init_pe_size: [512,864]
 mid_pe_size: [512,864]
+
 # Matcher
-set_cost_class: 1
+set_cost_class: 4
 set_cost_bbox: 5
 set_cost_giou: 2
 # Loss coefficients
-ce_loss_coef: 1
+ce_loss_coef: 4
 bbox_loss_coef: 5
 giou_loss_coef: 2
 eos_coef: 0.2
+
 # dataset parameters
 dataset_file: voc # options: ["coco","voc"]
 num_classes: 20
 coco_path: data/VOC2012_train_val
-coco_panoptic_path:
 remove_difficult: False
-
 output_dir: outputs/baseline
 device: cuda
 seed: 42
 resume: # resume from checkpoint
-start_epoch: 0
 eval: False
-num_workers: 128
-# distributed training parameters
-world_size: 1
-dist_url: env://
+start_epoch: 0
+num_workers: 100
