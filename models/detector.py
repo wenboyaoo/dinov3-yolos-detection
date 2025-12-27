@@ -34,7 +34,7 @@ class Detector(nn.Module):
         super().__init__()
         # import pdb;pdb.set_trace()
         self.backbone, hidden_dim = build_backbone(**vars(args))
-        self.class_embed = MLP(hidden_dim, hidden_dim, args.num_classes, 3)
+        self.class_embed = MLP(hidden_dim, hidden_dim, args.num_classes+1, 3)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         unfreeze = [] if args.unfreeze is None else args.unfreeze
         for name, p in self.backbone.named_parameters():
@@ -289,7 +289,7 @@ def build(args):
     #     weight_dict.update(aux_weight_dict)
 
     losses = ['labels', 'boxes', 'cardinality']
-    criterion = SetCriterion(args.num_classes+1, matcher=matcher, weight_dict=weight_dict,
+    criterion = SetCriterion(args.num_classes, matcher=matcher, weight_dict=weight_dict,
                              eos_coef=args.eos_coef, losses=losses)
     criterion.to(device)
     postprocessors = {'bbox': PostProcess()}
