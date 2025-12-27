@@ -1,4 +1,5 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+import os
 import argparse
 import datetime
 import json
@@ -133,6 +134,12 @@ def main(args):
     for k, v in vars(args).items():
         print(f"  {k}: {v}")
     print()
+    out_path = os.path.join(args.output_dir, "args.txt")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("Arguments:\n")
+        for k, v in vars(args).items():
+            f.write(f"  {k}: {v}\n")
+        f.write("\n")
     device = torch.device(args.device)
 
     # fix the seed for reproducibility

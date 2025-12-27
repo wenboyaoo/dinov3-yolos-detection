@@ -27,7 +27,8 @@ from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.pytorch_utils import compile_compatible_method_lru_cache
-from transformers.utils import TransformersKwargs, auto_docstring, logging
+from transformers.utils import TransformersKwargs, logging, is_torch_npu_available, is_torch_xpu_available
+from transformers.utils.import_utils import is_torch_greater_or_equal
 from transformers.utils.generic import check_model_inputs
 from transformers.configuration_utils import PretrainedConfig
 
@@ -325,6 +326,22 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
+def _to_additive_gate(
+    gate: torch.Tensor,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    gate = gate.to(device=device)
+
+    if gate.dtype == torch.bool:
+        neg_inf = torch.finfo(dtype).min
+        return torch.where(
+            gate,
+            torch.zeros((), device=device, dtype=dtype),
+            torch.full((), neg_inf, device=device, dtype=dtype),
+        )
+    else:
+        return gate.to(dtype=dtype, device=device)
 
 def eager_attention_forward(
     module: nn.Module,
@@ -339,10 +356,9 @@ def eager_attention_forward(
 ):
     # Take the dot product between "query" and "key" to get the raw attention scores.
     attn_weights = torch.matmul(query, key.transpose(-1, -2)) * scaling
-
     if attention_gate is not None:
-        attn_weights = attn_weights.masked_fill(~attention_gate, torch.finfo(attn_weights.dtype).min)
-
+        additive_gate = _to_additive_gate(gate=attention_gate, dtype=attn_weights.dtype, device=attn_weights.device)
+        attn_weights = attn_weights + additive_gate
     # Normalize the attention scores to probabilities.
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
 
@@ -359,6 +375,98 @@ def eager_attention_forward(
 
     return attn_output, attn_weights
 
+logger = logging.get_logger(__name__)
+
+_is_torch_greater_or_equal_than_2_5 = is_torch_greater_or_equal("2.5", accept_dev=True)
+_is_torch_greater_or_equal_than_2_8 = is_torch_greater_or_equal("2.8", accept_dev=True)
+_is_torch_xpu_available = is_torch_xpu_available()
+_is_torch_npu_available = is_torch_npu_available()
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def use_gqa_in_sdpa(attention_mask: Optional[torch.Tensor], key: torch.Tensor) -> bool:
+    # GQA can only be used under the following conditions
+    # 1.cuda
+    #   - torch version >= 2.5
+    #   - attention_mask is None (otherwise it will fall back to the math kernel)
+    #   - key is not a torch.fx.Proxy (otherwise it will fail with a tracing error)
+    # 2.xpu
+    #   - torch version >= 2.8
+    #   - key is not a torch.fx.Proxy (otherwise it will fail with a tracing error)
+    # 3.npu
+    #   - npu is not supported gqa currently
+    if _is_torch_xpu_available:
+        return _is_torch_greater_or_equal_than_2_8 and not isinstance(key, torch.fx.Proxy)
+    if _is_torch_npu_available:
+        return False
+    return _is_torch_greater_or_equal_than_2_5 and attention_mask is None and not isinstance(key, torch.fx.Proxy)
+
+
+def sdpa_attention_forward(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_gate: Optional[torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    dropout: float = 0.0,
+    scaling: Optional[float] = None,
+    is_causal: Optional[bool] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+
+    if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
+        logger.warning_once(
+            "`sdpa` attention does not support `output_attentions=True` or `head_mask`."
+            " Please set your attention to `eager` if you want any of these features."
+        )
+
+    combined_mask = None
+    if attention_gate is not None:
+        combined_mask = _to_additive_gate(attention_gate, dtype=query.dtype, device=query.device)
+
+    sdpa_kwargs = {}
+    if hasattr(module, "num_key_value_groups"):
+        if not use_gqa_in_sdpa(combined_mask, key):
+            key = repeat_kv(key, module.num_key_value_groups)
+            value = repeat_kv(value, module.num_key_value_groups)
+        else:
+            sdpa_kwargs = {"enable_gqa": True}
+
+    if is_causal is None:
+        is_causal = query.shape[2] > 1 and combined_mask is None and getattr(module, "is_causal", True)
+
+    if torch.jit.is_tracing() and isinstance(is_causal, torch.Tensor):
+        is_causal = is_causal.item()
+
+    attn_output = torch.nn.functional.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=combined_mask,
+        dropout_p=dropout,
+        scale=scaling,
+        is_causal=is_causal,
+        **sdpa_kwargs,
+    )
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output, None
+
+
+MODIFIED_ATTENTION_FUNCTIONS = {
+    "sdpa": sdpa_attention_forward
+}
 
 def apply_rotary_pos_emb(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, **kwargs
@@ -391,7 +499,6 @@ def apply_rotary_pos_emb(
     k = torch.cat((k_prefix_tokens, k_patches), dim=-2)
 
     return q, k
-
 
 class DINOv3ViTAttention(nn.Module):
     """
@@ -440,8 +547,17 @@ class DINOv3ViTAttention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        impl = self.config._attn_implementation
+        if impl != "eager":
+            needs_gate = attention_gate is not None
+            if needs_gate and impl not in MODIFIED_ATTENTION_FUNCTIONS:
+                logger.warning_once(
+                    f"{impl} attention has not been modified for additive attention gate. "
+                    "Please set attention implementation to `eager` if you want to apply attention gates before softmax."
+                )
+                attention_interface = ALL_ATTENTION_FUNCTIONS[impl]
+            else:
+                attention_interface = MODIFIED_ATTENTION_FUNCTIONS[impl] if needs_gate else ALL_ATTENTION_FUNCTIONS[impl]
 
         attn_output, attn_weights = attention_interface(
             module=self,
@@ -662,7 +778,6 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         pixel_values = pixel_values.to(self.embeddings.patch_embeddings.weight.dtype)
         hidden_states = self.embeddings(pixel_values, bool_masked_pos=bool_masked_pos)
         position_embeddings = self.rope_embeddings(pixel_values)
-
         for i, layer_module in enumerate(self.layer):
             layer_head_mask = head_mask[i] if head_mask is not None else None
             layer_gate = attention_gate[i]if attention_gate is not None else None
@@ -714,4 +829,3 @@ def build_dinov3(pretrained=None, **kwargs):
     model, info = DINOv3Backbone.from_pretrained(pretrained, ignore_mismatched_sizes=True, output_loading_info=True, **kwargs)
     model.init_unloaded_parameters(info)
     return model, model.config.hidden_size
-
