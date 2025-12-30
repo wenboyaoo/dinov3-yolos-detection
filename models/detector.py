@@ -29,6 +29,25 @@ class MLP(nn.Module):
             x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
 
+class DetFeatureMLP(nn.Module):
+    def __init__(self, dim, mlp_ratio=4.0, dropout=0.0):
+        super().__init__()
+        hidden = int(dim * mlp_ratio)
+        self.norm = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, hidden)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden, dim)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        h = self.norm(x)
+        h = self.fc1(h)
+        h = self.act(h)
+        h = self.drop(h)
+        h = self.fc2(h)
+        h = self.drop(h)
+        return x + h
+    
 class Detector(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -36,6 +55,9 @@ class Detector(nn.Module):
         self.backbone, hidden_dim = build_backbone(**vars(args))
         self.class_embed = MLP(hidden_dim, hidden_dim, args.num_classes+1, 3)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        self.det_feature_mlp = None
+        if args.enable_det_feature_mlp:
+            self.det_feature_mlp = DetFeatureMLP(dim=args.num_det_tokens, mlp_ratio=4.0, dropout=0.0)
         unfreeze = [] if args.unfreeze is None else args.unfreeze
         for name, p in self.backbone.named_parameters():
             p.requires_grad = False
@@ -54,10 +76,21 @@ class Detector(nn.Module):
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
         x = self.backbone(samples.tensors)
+        if self.det_feature_mlp is not None:
+            x.transpose(1,2)
+            x = self.det_feature_mlp(x)
+            x.transpose(1,2)
         outputs_class = self.class_embed(x)
         outputs_coord = self.bbox_embed(x).sigmoid()
         out = {'pred_logits': outputs_class, 'pred_boxes': outputs_coord}
         return out
+    
+    @torch.jit.ignore
+    def get_attentions(self, samples: NestedTensor):
+        if isinstance(samples, (list, torch.Tensor)):
+            samples = nested_tensor_from_tensor_list(samples)
+        x = self.backbone.get_attentions(samples.tensors)
+        return x
 
 class SetCriterion(nn.Module):
     """ This class computes the loss for DETR.
@@ -264,18 +297,8 @@ class PostProcess(nn.Module):
 
         return results
 
-# the `num_classes` naming here is somewhat misleading.
-# it indeed corresponds to `max_obj_id + 1`, where max_obj_id
-# is the maximum id for a class in your dataset. For example,
-# COCO has a max_obj_id of 90, so we pass `num_classes` to be 91.
-# As another example, for a dataset that has a single class with id 1,
-# you should pass `num_classes` to be 2 (max_obj_id + 1).
-# For more details on this, check the following discussion
-# https://github.com/facebookresearch/detr/issues/108#issuecomment-650269223
 
 def build(args):
-    if hasattr(args, 'num_classes'):
-        args.num_classes = args.num_classes+1 
     device = torch.device(args.device)
     # import pdb;pdb.set_trace()
     model = Detector(args)

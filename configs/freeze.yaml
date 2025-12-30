@@ -1,6 +1,5 @@
 lr: 8.0e-4
 backbone_lr: 8.0e-5
-layer_decay: 1
 batch_size: 32
 weight_decay: 5.0e-4
 epochs: 75
@@ -13,8 +12,6 @@ save_epochs: 10
 
 # scheduler
 sched: warmupcos # options: ["step", "warmupcos"]
-## step
-lr_drop: 100
 ## warmupcosine
 warmup_lr: 1.0e-6
 min_lr: 1.0e-6
@@ -22,7 +19,6 @@ warmup_epochs: 5
 decay_rate: 0.1
 
 # model setting
-num_det_token: 100
 backbone: dinov3 # options: ["vanilla_vit", "dinov3"]
 pretrained: facebook/dinov3-vits16-pretrain-lvd1689m
 unfreeze: 
@@ -60,3 +56,8 @@ resume: # resume from checkpoint
 eval: False
 start_epoch: 0
 num_workers: 100
+
+num_det_tokens: 100
+gate_det_tokens: True
+enable_det_rope: True
+enable_det_feature_mlp: True

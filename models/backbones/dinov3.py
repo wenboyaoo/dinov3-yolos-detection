@@ -136,12 +136,14 @@ class DINOv3ViTConfig(PretrainedConfig):
         drop_path_rate: float = 0.0,
         use_gated_mlp: bool = False,
         num_register_tokens: int = 0,
-        num_det_token: int = 100,
-        use_checkpoint : bool = False,
         # train augs
         pos_embed_shift: Optional[float] = None,
         pos_embed_jitter: Optional[float] = None,
-        pos_embed_rescale: Optional[float] = 2.0,
+        pos_embed_rescale: Optional[float] = None,
+
+        num_det_tokens: int = 100,
+        gate_det_tokens: bool = False,
+        enable_det_rope: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -173,7 +175,9 @@ class DINOv3ViTConfig(PretrainedConfig):
         self.pos_embed_jitter = pos_embed_jitter
         self.pos_embed_rescale = pos_embed_rescale
 
-        self.num_det_tokens = num_det_token
+        self.num_det_tokens = num_det_tokens
+        self.gate_det_tokens = gate_det_tokens
+        self.enable_det_rope = enable_det_rope
 
 class DINOv3ViTEmbeddings(nn.Module):
     """
@@ -186,16 +190,15 @@ class DINOv3ViTEmbeddings(nn.Module):
         self.cls_token = nn.Parameter(torch.randn(1, 1, config.hidden_size))
         self.mask_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
         self.register_tokens = nn.Parameter(torch.empty(1, config.num_register_tokens, config.hidden_size))
-        self.det_tokens = nn.Parameter(torch.empty(1, config.num_det_tokens, config.hidden_size))
         self.patch_embeddings = nn.Conv2d(
             config.num_channels, config.hidden_size, kernel_size=config.patch_size, stride=config.patch_size
         )
+        self.det_tokens = nn.Parameter(torch.empty(1, config.num_det_tokens, config.hidden_size))
 
     def forward(self, pixel_values: torch.Tensor, bool_masked_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
         batch_size = pixel_values.shape[0]
         target_dtype = self.patch_embeddings.weight.dtype
 
-        # (batch_size, num_channels, height, width) -> (batch_size, num_patches, hidden_size)
         patch_embeddings = self.patch_embeddings(pixel_values.to(dtype=target_dtype))
         patch_embeddings = patch_embeddings.flatten(2).transpose(1, 2)
 
@@ -203,11 +206,10 @@ class DINOv3ViTEmbeddings(nn.Module):
             mask_token = self.mask_token.to(patch_embeddings.dtype)
             patch_embeddings = torch.where(bool_masked_pos.unsqueeze(-1), mask_token, patch_embeddings)
 
-        # Add CLS and register tokens
         cls_token = self.cls_token.expand(batch_size, -1, -1)
         register_tokens = self.register_tokens.expand(batch_size, -1, -1)
         det_tokens = self.det_tokens.expand(batch_size, -1, -1)
-        embeddings = torch.cat([cls_token, register_tokens, det_tokens, patch_embeddings], dim=1)
+        embeddings = torch.cat([cls_token, register_tokens, patch_embeddings, det_tokens], dim=1)
 
         return embeddings
 
@@ -231,10 +233,9 @@ def get_patches_center_coordinates(
     """
     coords_h = torch.arange(0.5, num_patches_h, dtype=dtype, device=device)
     coords_w = torch.arange(0.5, num_patches_w, dtype=dtype, device=device)
-    coords_h = coords_h / num_patches_h # (0.5/nh, 1.5/nh, ... , n-0.5/nh)
-    coords_w = coords_w / num_patches_w# (0.5/nw, 1.5/nw, ... , n-0.5/nw)
-    # (height, width, 2) -> (height * width, 2)
-    coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"), dim=-1) #([[0.5/nh,0/5/],[1.5/,...]],[复制n行])
+    coords_h = coords_h / num_patches_h
+    coords_w = coords_w / num_patches_w
+    coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"), dim=-1)
     coords = coords.flatten(0, 1)
     # Shift range [0, 1] to [-1, +1]
     coords = 2.0 * coords - 1.0
@@ -282,13 +283,13 @@ class DINOv3ViTRopePositionEmbedding(nn.Module):
         self.num_patches_h = config.image_size // config.patch_size
         self.num_patches_w = config.image_size // config.patch_size
 
-        inv_freq = 1 / self.base ** torch.arange(0, 1, 4 / self.head_dim, dtype=torch.float32)  # 1/(base^(0,4/d,8/d,....,1))
+        inv_freq = 1 / self.base ** torch.arange(0, 1, 4 / self.head_dim, dtype=torch.float32)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, pixel_values: torch.Tensor, patch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
         _, _, height, width = pixel_values.shape
-        num_patches_h = height // self.config.patch_size
-        num_patches_w = width // self.config.patch_size
+        num_patches_h = height // patch_size
+        num_patches_w = width // patch_size
 
         device = pixel_values.device
         device_type = device.type if isinstance(device.type, str) and device.type != "mps" else "cpu"
@@ -299,16 +300,8 @@ class DINOv3ViTRopePositionEmbedding(nn.Module):
             # Therefore, it's better to compute patch_coords dynamically (with lru_cache).
             patch_coords = get_patches_center_coordinates(
                 num_patches_h, num_patches_w, dtype=torch.float32, device=device
-            ) #(h*w,(y_norm,x_norm))
-            if self.training:
-                patch_coords = augment_patches_center_coordinates(
-                    patch_coords,
-                    shift=self.config.pos_embed_shift,
-                    jitter=self.config.pos_embed_jitter,
-                    rescale=self.config.pos_embed_rescale,
-                )
+            )
 
-            # (height * width, 2, head_dim / 4) -> (height * width, head_dim / 2) -> (height * width, head_dim)
             angles = 2 * math.pi * patch_coords[:, :, None] * self.inv_freq[None, None, :]
             angles = angles.flatten(1, 2)
             angles = angles.tile(2)
@@ -469,7 +462,8 @@ MODIFIED_ATTENTION_FUNCTIONS = {
 }
 
 def apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, **kwargs
+    q: torch.Tensor, k: torch.Tensor, cos_sin: list[torch.Tensor], 
+    start: int, end: int, **kwargs
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Applies Rotary Position Embedding to the query and key tensors, but only to the patch tokens,
     ignoring the prefix tokens (cls token and register tokens).
@@ -484,19 +478,19 @@ def apply_rotary_pos_emb(
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
 
-    num_tokens = q.shape[-2]
-    num_patches = sin.shape[-2]
-    num_prefix_tokens = num_tokens - num_patches  # cls token + register tokens + det tokens
+    num_prefix = start
+    num_tokens = end - start
+    num_suffix = q.shape[-2] - end
 
-    q_prefix_tokens, q_patches = q.split((num_prefix_tokens, num_patches), dim=-2)
-    k_prefix_tokens, k_patches = k.split((num_prefix_tokens, num_patches), dim=-2)
+    q_prefix, q_tokens, q_suffix = q.split((num_prefix, num_tokens, num_suffix), dim=-2)
+    k_prefix, k_tokens, k_suffix = k.split((num_prefix, num_tokens, num_suffix), dim=-2)
 
-    # apply rope only to patch tokens
-    q_patches = (q_patches * cos) + (rotate_half(q_patches) * sin)
-    k_patches = (k_patches * cos) + (rotate_half(k_patches) * sin)
+    cos, sin = cos_sin
+    q_tokens = (q_tokens * cos) + (rotate_half(q_tokens) * sin)
+    k_tokens = (k_tokens * cos) + (rotate_half(k_tokens) * sin)
 
-    q = torch.cat((q_prefix_tokens, q_patches), dim=-2)
-    k = torch.cat((k_prefix_tokens, k_patches), dim=-2)
+    q = torch.cat((q_prefix, q_tokens, q_suffix), dim=-2)
+    k = torch.cat((k_prefix, k_tokens, k_suffix), dim=-2)
 
     return q, k
 
@@ -528,23 +522,36 @@ class DINOv3ViTAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_gate: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        position_embeddings: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Input shape: Batch x Time x Channel"""
 
-        batch_size, patches, _ = hidden_states.size()
+        batch_size, num_tokens, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(batch_size, patches, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(batch_size, patches, self.num_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(batch_size, patches, self.num_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if position_embeddings is not None:
+            det_e = num_tokens
+            det_s = num_tokens - self.config.num_det_tokens
+            patch_e = det_s
+            patch_s = 1 + self.config.num_register_tokens
+            assert 0 <= patch_s <= patch_e <= det_s <= det_e == num_tokens
+            if self.config.enable_det_rope:
+                assert len(position_embeddings) == 2
+                patch_pos_embed, det_pos_embed = position_embeddings
+                query_states, key_states = apply_rotary_pos_emb(q=query_states, k=key_states, cos_sin=patch_pos_embed, start=patch_s, end=patch_e)
+                query_states, key_states = apply_rotary_pos_emb(q=query_states, k=key_states, cos_sin=det_pos_embed, start=det_s, end=det_e)
+            else:
+                assert len(position_embeddings) == 1
+                [patch_pos_embed] = position_embeddings
+                query_states, key_states = apply_rotary_pos_emb(q=query_states, k=key_states, cos_sin=patch_pos_embed, start=patch_s, end=patch_e)
 
         attention_interface: Callable = eager_attention_forward
         impl = self.config._attn_implementation
@@ -571,7 +578,7 @@ class DINOv3ViTAttention(nn.Module):
             **kwargs,
         )
 
-        attn_output = attn_output.reshape(batch_size, patches, -1).contiguous()
+        attn_output = attn_output.reshape(batch_size, num_tokens, -1).contiguous()
         attn_output = self.o_proj(attn_output)
 
         return attn_output, attn_weights
@@ -674,7 +681,7 @@ class DINOv3ViTLayer(GradientCheckpointingLayer):
         hidden_states: torch.Tensor,
         attention_gate: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        position_embeddings: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> torch.Tensor:
         # Attention with residual connection
         residual = hidden_states
@@ -744,7 +751,25 @@ class DINOv3ViTPreTrainedModel(PreTrainedModel):
         elif isinstance(module, DINOv3ViTLayerScale):
             module.lambda1.data.fill_(self.config.layerscale_value)
 
+def get_det_gate(num_tokens, config, device):
+    gate = torch.ones((num_tokens, num_tokens), dtype=torch.bool, device=device)
 
+    det_e = num_tokens
+    det_s = num_tokens - config.num_det_tokens
+    patch_e = det_s
+    patch_s = 1 + config.num_register_tokens
+    assert 0 <= patch_s <= patch_e <= det_s <= det_e == num_tokens
+
+    false_blocks = [
+        (slice(0, patch_e),slice(det_s,det_e))
+    ]
+
+    for qs, ks in false_blocks:
+        gate[qs, ks] = False
+
+    return gate
+
+    
 class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
     def __init__(self, config: DINOv3ViTConfig, **kwargs):
         super().__init__(config)
@@ -757,6 +782,14 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        if self.config.enable_det_rope:
+            n = self.config.num_det_tokens
+            hw = math.isqrt(n)
+            assert hw * hw == n, f"num_det_tokens must be a perfect square, got {n}"
+            dummy = torch.zeros(1, 1, hw, hw)
+            det_pos = torch.stack(self.rope_embeddings(dummy, patch_size=1), dim=0)
+            self.register_buffer("det_position_embeddings", det_pos, persistent=False)
+
     def get_input_embeddings(self):
         return self.embeddings.patch_embeddings
 
@@ -766,7 +799,6 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         pixel_values: torch.Tensor,
         bool_masked_pos: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
-        attention_gate: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPooling:
         r"""
@@ -777,10 +809,18 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
 
         pixel_values = pixel_values.to(self.embeddings.patch_embeddings.weight.dtype)
         hidden_states = self.embeddings(pixel_values, bool_masked_pos=bool_masked_pos)
-        position_embeddings = self.rope_embeddings(pixel_values)
+
+        patch_position_embeddings = self.rope_embeddings(pixel_values, patch_size=self.config.patch_size)
+        position_embeddings = [patch_position_embeddings]
+        if self.config.enable_det_rope:
+            position_embeddings.append(tuple(self.det_position_embeddings))
+        
+        layer_gate = None
+        if self.config.gate_det_tokens:
+            layer_gate = get_det_gate(hidden_states.shape[-2], self.config, hidden_states.device)
+
         for i, layer_module in enumerate(self.layer):
             layer_head_mask = head_mask[i] if head_mask is not None else None
-            layer_gate = attention_gate[i]if attention_gate is not None else None
             hidden_states = layer_module(
                 hidden_states,
                 attention_gate=layer_gate,
@@ -798,16 +838,16 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
 
 
 class DINOv3Backbone(DINOv3ViTModel):
-    def __init__(self, config: DINOv3ViTConfig, **kwargs):
+    def __init__(self, config: DINOv3ViTConfig, gate=False, **kwargs):
         super().__init__(config)
-        self.attention_gate = None
+        self.gate = gate
 
     def forward(self, x):
-        return super().forward(x, attention_gate=self.attention_gate).last_hidden_state[:, 1+self.config.num_register_tokens:1+self.config.num_register_tokens+self.config.num_det_tokens,:]
+        return super().forward(x, gate=self.gate).last_hidden_state[:, -self.config.num_det_tokens:,:]
     
     @torch.jit.ignore
     def get_attentions(self, x):
-        return super().forward(x, attention_gate=self.attention_gate).attentions
+        return torch.stack(super().forward(x, gate=self.gate).attentions)
     
     @torch.jit.ignore
     def get_blocks(self):
@@ -825,7 +865,7 @@ class DINOv3Backbone(DINOv3ViTModel):
                 torch.nn.init.trunc_normal_(param_dict[name].data, std=self.config.initializer_range)
 
 
-def build_dinov3(pretrained=None, **kwargs):
-    model, info = DINOv3Backbone.from_pretrained(pretrained, ignore_mismatched_sizes=True, output_loading_info=True, **kwargs)
+def build_dinov3(pretrained=None, output_attentions=False, **kwargs):
+    model, info = DINOv3Backbone.from_pretrained(pretrained, ignore_mismatched_sizes=True, output_loading_info=True, output_attentions=output_attentions, **kwargs)
     model.init_unloaded_parameters(info)
     return model, model.config.hidden_size
