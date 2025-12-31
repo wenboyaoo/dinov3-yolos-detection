@@ -65,7 +65,7 @@ def get_args_parser():
                         help='LR decay rate (default: 0.1)')
 
     # * model setting
-    parser.add_argument('--num-det-token', default=100, type=int,
+    parser.add_argument('--num-det-tokens', default=100, type=int,
                         help="Number of det token in the deit backbone")
     parser.add_argument('--backbone', default='dinov3', type=str,
                         help="Name of the backbone to use"),
