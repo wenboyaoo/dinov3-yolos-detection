@@ -142,8 +142,9 @@ class DINOv3ViTConfig(PretrainedConfig):
         pos_embed_rescale: Optional[float] = None,
 
         num_det_tokens: int = 100,
-        gate_det_tokens: bool = False,
+        det_token_gate: Optional[str] = None,
         enable_det_rope: bool = False,
+        enable_det_additive_embed: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -176,8 +177,9 @@ class DINOv3ViTConfig(PretrainedConfig):
         self.pos_embed_rescale = pos_embed_rescale
 
         self.num_det_tokens = num_det_tokens
-        self.gate_det_tokens = gate_det_tokens
+        self.det_token_gate = det_token_gate
         self.enable_det_rope = enable_det_rope
+        self.enable_det_additive_embed = enable_det_additive_embed
 
 class DINOv3ViTEmbeddings(nn.Module):
     """
@@ -752,20 +754,24 @@ class DINOv3ViTPreTrainedModel(PreTrainedModel):
             module.lambda1.data.fill_(self.config.layerscale_value)
 
 def get_det_gate(num_tokens, config, device):
-    gate = torch.ones((num_tokens, num_tokens), dtype=torch.bool, device=device)
+    if config.det_token_gate is None:
+        return None
+    else:
+        det_e = num_tokens
+        det_s = num_tokens - config.num_det_tokens
+        patch_e = det_s
+        patch_s = 1 + config.num_register_tokens
+        assert 0 <= patch_s <= patch_e <= det_s <= det_e == num_tokens
+        GATE_TYPES = {
+            "block_non_det_read_det":[ (slice(0, patch_e),slice(det_s,det_e))],
+            "block_all_read_det":[ (slice(0, num_tokens),slice(det_s,det_e))],
+        }
+        gate_type = config.det_token_gate
+        assert gate_type in GATE_TYPES.keys(), f"Unknown det_token_gate={gate_type}"
+        gate = torch.ones((num_tokens, num_tokens), dtype=torch.bool, device=device)
 
-    det_e = num_tokens
-    det_s = num_tokens - config.num_det_tokens
-    patch_e = det_s
-    patch_s = 1 + config.num_register_tokens
-    assert 0 <= patch_s <= patch_e <= det_s <= det_e == num_tokens
-
-    false_blocks = [
-        (slice(0, patch_e),slice(det_s,det_e))
-    ]
-
-    for qs, ks in false_blocks:
-        gate[qs, ks] = False
+        for qs, ks in GATE_TYPES[gate_type]:
+            gate[qs, ks] = False
 
     return gate
 
@@ -778,6 +784,7 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         self.rope_embeddings = DINOv3ViTRopePositionEmbedding(config)
         self.layer = nn.ModuleList([DINOv3ViTLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.det_additive_embed = None
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
@@ -789,6 +796,13 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
             dummy = torch.zeros(1, 1, hw, hw)
             det_pos = torch.stack(self.rope_embeddings(dummy, patch_size=1), dim=0)
             self.register_buffer("det_position_embeddings", det_pos, persistent=False)
+        if self.config.enable_det_additive_embed:
+            self.det_additive_embed = nn.Parameter(torch.empty(self.config.num_hidden_layers, self.config.num_det_tokens, self.config.hidden_size))
+            nn.init.trunc_normal_(
+                self.det_additive_embed,
+                mean=0.0,
+                std=self.config.initializer_range,
+            )
 
     def get_input_embeddings(self):
         return self.embeddings.patch_embeddings
@@ -815,12 +829,14 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         if self.config.enable_det_rope:
             position_embeddings.append(tuple(self.det_position_embeddings))
         
-        layer_gate = None
-        if self.config.gate_det_tokens:
-            layer_gate = get_det_gate(hidden_states.shape[-2], self.config, hidden_states.device)
+        layer_gate = get_det_gate(hidden_states.shape[-2], self.config, hidden_states.device)
 
         for i, layer_module in enumerate(self.layer):
             layer_head_mask = head_mask[i] if head_mask is not None else None
+            if self.det_additive_embed is not None:
+                det_e = hidden_states.shape[1]
+                det_s = det_e - self.config.num_det_tokens
+                hidden_states[:,det_s:det_e,:] += self.det_additive_embed[i]
             hidden_states = layer_module(
                 hidden_states,
                 attention_gate=layer_gate,

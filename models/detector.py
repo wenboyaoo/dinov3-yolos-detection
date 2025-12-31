@@ -29,24 +29,26 @@ class MLP(nn.Module):
             x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
 
-class DetFeatureMLP(nn.Module):
-    def __init__(self, dim, mlp_ratio=4.0, dropout=0.0):
+class DetMLP(nn.Module):
+    def __init__(self, num_tokens, mlp_ratio=4.0, dropout=0.0):
         super().__init__()
-        hidden = int(dim * mlp_ratio)
-        self.norm = nn.LayerNorm(dim)
-        self.fc1 = nn.Linear(dim, hidden)
+        hidden = int(num_tokens * mlp_ratio)
+        self.norm = nn.LayerNorm(num_tokens)
+        self.fc1 = nn.Linear(num_tokens, hidden)
         self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden, dim)
+        self.fc2 = nn.Linear(hidden, num_tokens)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
-        h = self.norm(x)
+        x_t = x.transpose(1, 2)
+        h = self.norm(x_t)
         h = self.fc1(h)
         h = self.act(h)
         h = self.drop(h)
         h = self.fc2(h)
         h = self.drop(h)
-        return x + h
+        x_t = x_t + h
+        return x_t.transpose(1, 2) 
     
 class Detector(nn.Module):
     def __init__(self, args):
@@ -56,8 +58,8 @@ class Detector(nn.Module):
         self.class_embed = MLP(hidden_dim, hidden_dim, args.num_classes+1, 3)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.det_feature_mlp = None
-        if args.enable_det_feature_mlp:
-            self.det_feature_mlp = DetFeatureMLP(dim=args.num_det_tokens, mlp_ratio=4.0, dropout=0.0)
+        if args.enable_det_mlp:
+            self.det_mlp = DetMLP(num_tokens=args.num_det_tokens, mlp_ratio=4.0, dropout=0.0)
         unfreeze = [] if args.unfreeze is None else args.unfreeze
         for name, p in self.backbone.named_parameters():
             p.requires_grad = False
@@ -77,9 +79,7 @@ class Detector(nn.Module):
             samples = nested_tensor_from_tensor_list(samples)
         x = self.backbone(samples.tensors)
         if self.det_feature_mlp is not None:
-            x.transpose(1,2)
             x = self.det_feature_mlp(x)
-            x.transpose(1,2)
         outputs_class = self.class_embed(x)
         outputs_coord = self.bbox_embed(x).sigmoid()
         out = {'pred_logits': outputs_class, 'pred_boxes': outputs_coord}
@@ -279,7 +279,6 @@ class PostProcess(nn.Module):
                           For visualization, this should be the image size after data augment, but before padding
         """
         out_logits, out_bbox = outputs['pred_logits'], outputs['pred_boxes']
-
         assert len(out_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
 
@@ -318,4 +317,3 @@ def build(args):
     postprocessors = {'bbox': PostProcess()}
 
     return model, criterion, postprocessors
-

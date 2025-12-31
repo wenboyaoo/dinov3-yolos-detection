@@ -24,10 +24,12 @@ pretrained: facebook/dinov3-vits16-pretrain-lvd1689m
 unfreeze: 
   - class_embed
   - bbox_embed
+  - det_mlp
   - backbone.embeddings.det_tokens
-  - backbone.det_pos_embed
+  - backbone.det_additive_embed
 no_weight_decay:
   - det_tokens
+  - det_additive_embed
 ## vanilla_vit
 backbone_size: small
 use_checkpoint: False
@@ -49,7 +51,7 @@ dataset_file: voc # options: ["coco","voc"]
 num_classes: 20
 coco_path: data/VOC2012_train_val
 remove_difficult: False
-output_dir: outputs/freeze
+output_dir: outputs/sample
 device: cuda
 seed: 42
 resume: # resume from checkpoint
@@ -57,7 +59,8 @@ eval: False
 start_epoch: 0
 num_workers: 100
 
-num_det_tokens: 100
-gate_det_tokens: True
-enable_det_rope: True
-enable_det_feature_mlp: True
+det_token_gate: # ['block_non_det_read_det', 'block_all_read_det']
+enable_det_rope: False
+enable_det_additive_embed: False
+enable_det_mlp: False
+balance_traning_dataset: False

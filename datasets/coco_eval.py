@@ -68,6 +68,7 @@ class CocoEvaluator(object):
         for iou_type, coco_eval in self.coco_eval.items():
             print("IoU metric: {}".format(iou_type))
             coco_eval.summarize()
+            self.summarize_per_category(iou_type=iou_type, iou_thr=0.50, max_dets=100, area="all")
 
     def prepare(self, predictions, iou_type):
         if iou_type == "bbox":
@@ -163,6 +164,52 @@ class CocoEvaluator(object):
                 ]
             )
         return coco_results
+
+    def summarize_per_category(self, iou_type="bbox", iou_thr=0.50, max_dets=100, area="all"):
+        coco_eval = self.coco_eval[iou_type]
+        if coco_eval.eval is None:
+            raise RuntimeError("Please run accumulate() before summarize_per_category().")
+
+        cat_ids = coco_eval.params.catIds
+        cats = coco_eval.cocoGt.loadCats(cat_ids)
+        cat_id_to_name = {c["id"]: c.get("name", str(c["id"])) for c in cats}
+
+        prec = coco_eval.eval["precision"]
+        rec = coco_eval.eval["recall"]
+
+        ious = coco_eval.params.iouThrs
+        t = int(np.where(np.isclose(ious, iou_thr))[0][0])
+
+        area_lbls = coco_eval.params.areaRngLbl
+        if area not in area_lbls:
+            raise ValueError(f"area must be one of {area_lbls}, got {area}")
+        a = area_lbls.index(area)
+
+        m = coco_eval.params.maxDets.index(max_dets)
+
+        ap_per_class = []
+        for k, cid in enumerate(cat_ids):
+            p = prec[t, :, k, a, m]
+            p = p[p > -1]
+            ap = float(p.mean()) if p.size else float("nan")
+            ap_per_class.append((cid, cat_id_to_name[cid], ap))
+
+        recall_per_class = []
+        for k, cid in enumerate(cat_ids):
+            r = rec[t, k, a, m]
+            recall_per_class.append((cid, cat_id_to_name[cid], float(r)))
+
+        ap_sorted = sorted(ap_per_class, key=lambda x: (np.nan_to_num(x[2], nan=-1.0)))
+        print(f"\nPer-category AP@{iou_thr:.2f} ({iou_type}, area={area}, maxDets={max_dets}):")
+        for cid, name, ap in ap_sorted:
+            print(f"  {name:<12} (cid={cid:<3}) AP={ap:.3f}")
+
+        r_sorted = sorted(recall_per_class, key=lambda x: x[2])
+        print(f"\nPer-category Recall@{iou_thr:.2f} ({iou_type}, area={area}, maxDets={max_dets}):")
+        for cid, name, r in r_sorted:
+            print(f"  {name:<12} (cid={cid:<3}) R={r:.3f}")
+        print()
+
 
 
 def convert_to_xywh(boxes):

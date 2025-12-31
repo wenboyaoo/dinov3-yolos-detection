@@ -17,6 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 import datasets
 import util.misc as utils
 from datasets import build_dataset, get_coco_api_from_dataset
+from datasets.sampling import build_image_weights
 from engine import evaluate, train_one_epoch
 
 from models import build_model as build_yolos_model
@@ -110,7 +111,7 @@ def get_args_parser():
     parser.add_argument('--bf16', action='store_true',
                         help='Enable bfloat16 mixed precision training')
 
-    parser.add_argument('--config-path',default=None, help='path to .yaml configuration file')
+    parser.add_argument('--config-file',default=None, help='path to .yaml configuration file')
     return parser
 
 
@@ -185,7 +186,23 @@ def main(args):
     dataset_base = build_dataset(image_set='base', args=args)
 
     # import pdb;pdb.set_trace()
-    sampler_train = torch.utils.data.RandomSampler(dataset_train)
+    if args.balance_traning_dataset:
+        weights, _, _ = build_image_weights(
+            dataset_train,
+            alpha=0.5,
+            cap=10.0,
+            agg="max",
+        )
+        w = np.array(weights, dtype=np.float64)
+        weights = (w / w.min()).tolist()
+        w = np.array(weights)
+        sampler_train = torch.utils.data.WeightedRandomSampler(
+            weights=weights,
+            num_samples=len(dataset_train),
+            replacement=True,
+        )
+    else:
+        sampler_train = torch.utils.data.RandomSampler(dataset_train)
     sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
     batch_sampler_train = torch.utils.data.BatchSampler(
@@ -280,9 +297,9 @@ if __name__ == '__main__':
     
     cli_args = set(arg.lstrip('-').replace('-', '_') 
                    for arg in sys.argv[1:] 
-                   if arg.startswith('-') and not arg.startswith('--config_path'))
+                   if arg.startswith('-') and not arg.startswith('--config-file'))
     
-    args = load_config(args.config_path, args, cli_args)
+    args = load_config(args.config_file, args, cli_args)
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
