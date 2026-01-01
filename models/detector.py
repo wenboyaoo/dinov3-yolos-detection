@@ -29,26 +29,6 @@ class MLP(nn.Module):
             x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
 
-class DetMLP(nn.Module):
-    def __init__(self, num_tokens, mlp_ratio=4.0, dropout=0.0):
-        super().__init__()
-        hidden = int(num_tokens * mlp_ratio)
-        self.norm = nn.LayerNorm(num_tokens)
-        self.fc1 = nn.Linear(num_tokens, hidden)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden, num_tokens)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x):
-        x_t = x.transpose(1, 2)
-        h = self.norm(x_t)
-        h = self.fc1(h)
-        h = self.act(h)
-        h = self.drop(h)
-        h = self.fc2(h)
-        h = self.drop(h)
-        x_t = x_t + h
-        return x_t.transpose(1, 2) 
     
 class Detector(nn.Module):
     def __init__(self, args):
@@ -57,9 +37,9 @@ class Detector(nn.Module):
         self.backbone, hidden_dim = build_backbone(**vars(args))
         self.class_embed = MLP(hidden_dim, hidden_dim, args.num_classes+1, 3)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
-        self.det_feature_mlp = None
-        if args.enable_det_mlp:
-            self.det_mlp = DetMLP(num_tokens=args.num_det_tokens, mlp_ratio=4.0, dropout=0.0)
+        self.det_mixer = None
+        if args.enable_det_mixer:
+            self.det_mixer = MLP(args.num_det_tokens, args.num_det_tokens, args.num_det_tokens, 3)
         unfreeze = [] if args.unfreeze is None else args.unfreeze
         for name, p in self.backbone.named_parameters():
             p.requires_grad = False
@@ -78,8 +58,10 @@ class Detector(nn.Module):
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
         x = self.backbone(samples.tensors)
-        if self.det_feature_mlp is not None:
-            x = self.det_feature_mlp(x)
+        if self.det_mixer is not None:
+            x = x.transpose(1,2)
+            x = self.det_mixer(x)
+            x = x.transpose(1,2)
         outputs_class = self.class_embed(x)
         outputs_coord = self.bbox_embed(x).sigmoid()
         out = {'pred_logits': outputs_class, 'pred_boxes': outputs_coord}
