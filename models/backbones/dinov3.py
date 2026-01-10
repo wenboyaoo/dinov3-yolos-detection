@@ -523,7 +523,7 @@ class DINOv3ViTAttention(nn.Module):
         attention_gate: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_embeddings: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
-        **kwargs: Unpack[TransformersKwargs],
+		**kwargs: Any,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Input shape: Batch x Time x Channel"""
 
@@ -835,7 +835,7 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         pixel_values: torch.Tensor,
         bool_masked_pos: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
+		**kwargs: Any,
     ) -> BaseModelOutputWithPooling:
         r"""
         bool_masked_pos (`torch.BoolTensor` of shape `(batch_size, sequence_length)`):
