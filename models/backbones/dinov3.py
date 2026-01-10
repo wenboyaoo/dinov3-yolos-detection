@@ -13,8 +13,7 @@
 # limitations under the License.
 
 import math
-from typing import Callable, Optional
-from typing_extensions import Unpack
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -25,9 +24,8 @@ from transformers.activations import ACT2FN
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.processing_utils import Unpack
 from transformers.pytorch_utils import compile_compatible_method_lru_cache
-from transformers.utils import TransformersKwargs, logging, is_torch_npu_available, is_torch_xpu_available
+from transformers.utils import logging, is_torch_npu_available, is_torch_xpu_available
 from transformers.utils.import_utils import is_torch_greater_or_equal
 from transformers.utils.generic import check_model_inputs
 from transformers.configuration_utils import PretrainedConfig
@@ -580,6 +578,28 @@ class DINOv3ViTAttention(nn.Module):
             **kwargs,
         )
 
+        if (not self.training) and bool(kwargs.get("collect_det_to_patch_attn", False)):
+            try:
+                det_e = num_tokens
+                det_s = num_tokens - self.config.num_det_tokens
+                patch_e = det_s
+                patch_s = 1 + self.config.num_register_tokens
+                if 0 <= patch_s <= patch_e <= det_s <= det_e == num_tokens:
+                    q_det = query_states[:, :, det_s:det_e, :]
+                    scores = torch.matmul(q_det, key_states.transpose(-1, -2)) * self.scaling
+                    if attention_gate is not None:
+                        additive_gate = _to_additive_gate(
+                            gate=attention_gate, dtype=scores.dtype, device=scores.device
+                        )
+                        scores = scores + additive_gate[det_s:det_e, :]
+                    probs = torch.nn.functional.softmax(scores, dim=-1, dtype=torch.float32).to(q_det.dtype)
+                    det_to_patch = probs[:, :, :, patch_s:patch_e].mean(dim=1)
+                    self._last_det_to_patch_attn_meanheads_cpu = det_to_patch.detach().to(
+                        device="cpu", dtype=torch.float16
+                    )
+            except Exception:
+                self._last_det_to_patch_attn_meanheads_cpu = None
+
         attn_output = attn_output.reshape(batch_size, num_tokens, -1).contiguous()
         attn_output = self.o_proj(attn_output)
 
@@ -684,6 +704,7 @@ class DINOv3ViTLayer(GradientCheckpointingLayer):
         attention_gate: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_embeddings: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
+        collect_det_to_patch_attn: bool = False,
     ) -> torch.Tensor:
         # Attention with residual connection
         residual = hidden_states
@@ -693,6 +714,7 @@ class DINOv3ViTLayer(GradientCheckpointingLayer):
             attention_gate=attention_gate,
             attention_mask=attention_mask,
             position_embeddings=position_embeddings,
+            collect_det_to_patch_attn=collect_det_to_patch_attn,
         )
         hidden_states = self.layer_scale1(hidden_states)
         hidden_states = self.drop_path(hidden_states) + residual
@@ -831,6 +853,8 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         
         layer_gate = get_det_gate(hidden_states.shape[-2], self.config, hidden_states.device)
 
+        collect_det_to_patch_attn = bool(kwargs.pop("collect_det_to_patch_attn", False))
+
         for i, layer_module in enumerate(self.layer):
             layer_head_mask = head_mask[i] if head_mask is not None else None
             if self.det_additive_embed is not None:
@@ -842,6 +866,7 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
                 attention_gate=layer_gate,
                 attention_mask=layer_head_mask,
                 position_embeddings=position_embeddings,
+                collect_det_to_patch_attn=collect_det_to_patch_attn,
             )
 
         sequence_output = self.norm(hidden_states)
@@ -858,12 +883,133 @@ class DINOv3Backbone(DINOv3ViTModel):
         super().__init__(config)
         self.gate = gate
 
-    def forward(self, x):
-        return super().forward(x, gate=self.gate).last_hidden_state[:, -self.config.num_det_tokens:,:]
+    def forward(self, x, collect_det_to_patch_attn: bool = False):
+        out = super().forward(x, gate=self.gate, collect_det_to_patch_attn=collect_det_to_patch_attn)
+
+        if collect_det_to_patch_attn:
+            try:
+                layers = []
+                for layer in self.layer:
+                    layers.append(getattr(layer.attention, "_last_det_to_patch_attn_meanheads_cpu", None))
+                self._det_to_patch_attn_meanheads_cpu_layers = layers
+                self._last_det_to_patch_attn_meanheads_cpu = layers[-1] if layers else None
+            except Exception:
+                self._det_to_patch_attn_meanheads_cpu_layers = None
+                self._last_det_to_patch_attn_meanheads_cpu = getattr(
+                    self.layer[-1].attention, "_last_det_to_patch_attn_meanheads_cpu", None
+                )
+
+        return out.last_hidden_state[:, -self.config.num_det_tokens:,:]
+
+    @torch.jit.ignore
+    def pop_last_det_to_patch_attn_meanheads_cpu(self):
+        v = getattr(self, "_last_det_to_patch_attn_meanheads_cpu", None)
+        self._last_det_to_patch_attn_meanheads_cpu = None
+        return v
+
+    @torch.jit.ignore
+    def pop_det_to_patch_attn_meanheads_cpu_layers(self):
+        v = getattr(self, "_det_to_patch_attn_meanheads_cpu_layers", None)
+        self._det_to_patch_attn_meanheads_cpu_layers = None
+        if not isinstance(v, (list, tuple)) or len(v) == 0:
+            return None
+        # Prefer returning a dense tensor [L,B,det,patch] for downstream code.
+        # Some layers may fail to compute attention (stored as None); in that case, fill with zeros.
+        try:
+            first = None
+            for x in v:
+                if torch.is_tensor(x):
+                    first = x
+                    break
+            if first is None:
+                return None
+
+            filled = []
+            for x in v:
+                if torch.is_tensor(x):
+                    filled.append(x)
+                else:
+                    filled.append(torch.zeros_like(first))
+            return torch.stack(filled, dim=0)
+        except Exception:
+            # Fallback to raw list if something unexpected happens.
+            return v
     
     @torch.jit.ignore
     def get_attentions(self, x):
         return torch.stack(super().forward(x, gate=self.gate).attentions)
+
+    @torch.jit.ignore
+    def get_last_layer_det_to_patch_attn_meanheads(self, x):
+        with torch.no_grad():
+            pixel_values = x
+            pixel_values = pixel_values.to(self.embeddings.patch_embeddings.weight.dtype)
+            hidden_states = self.embeddings(pixel_values)
+
+            patch_position_embeddings = self.rope_embeddings(pixel_values, patch_size=self.config.patch_size)
+            position_embeddings = [patch_position_embeddings]
+            if self.config.enable_det_rope:
+                position_embeddings.append(tuple(self.det_position_embeddings))
+
+            layer_gate = get_det_gate(hidden_states.shape[-2], self.config, hidden_states.device)
+
+            if len(self.layer) == 0:
+                return torch.empty((hidden_states.shape[0], self.config.num_det_tokens, 0), device=hidden_states.device)
+
+            for i, layer_module in enumerate(self.layer[:-1]):
+                if self.det_additive_embed is not None:
+                    det_e = hidden_states.shape[1]
+                    det_s = det_e - self.config.num_det_tokens
+                    hidden_states[:, det_s:det_e, :] += self.det_additive_embed[i]
+                hidden_states = layer_module(
+                    hidden_states,
+                    attention_gate=layer_gate,
+                    attention_mask=None,
+                    position_embeddings=position_embeddings,
+                )
+
+            last_layer = self.layer[-1]
+            if self.det_additive_embed is not None:
+                det_e = hidden_states.shape[1]
+                det_s = det_e - self.config.num_det_tokens
+                hidden_states[:, det_s:det_e, :] += self.det_additive_embed[len(self.layer) - 1]
+
+            hs_norm = last_layer.norm1(hidden_states)
+            attn_mod = last_layer.attention
+
+            batch_size, num_tokens, _ = hs_norm.size()
+            num_heads = attn_mod.num_heads
+            head_dim = attn_mod.head_dim
+            scaling = attn_mod.scaling
+
+            q = attn_mod.q_proj(hs_norm).view(batch_size, num_tokens, num_heads, head_dim).transpose(1, 2)
+            k = attn_mod.k_proj(hs_norm).view(batch_size, num_tokens, num_heads, head_dim).transpose(1, 2)
+
+            det_e = num_tokens
+            det_s = num_tokens - self.config.num_det_tokens
+            patch_e = det_s
+            patch_s = 1 + self.config.num_register_tokens
+            if position_embeddings is not None:
+                if self.config.enable_det_rope:
+                    patch_pos_embed, det_pos_embed = position_embeddings
+                    q, k = apply_rotary_pos_emb(q=q, k=k, cos_sin=patch_pos_embed, start=patch_s, end=patch_e)
+                    q, k = apply_rotary_pos_emb(q=q, k=k, cos_sin=det_pos_embed, start=det_s, end=det_e)
+                else:
+                    [patch_pos_embed] = position_embeddings
+                    q, k = apply_rotary_pos_emb(q=q, k=k, cos_sin=patch_pos_embed, start=patch_s, end=patch_e)
+
+            additive_gate = None
+            if layer_gate is not None:
+                additive_gate = _to_additive_gate(gate=layer_gate, dtype=q.dtype, device=q.device)
+
+            q_det = q[:, :, det_s:det_e, :]
+            scores = torch.matmul(q_det, k.transpose(-1, -2)) * scaling
+            if additive_gate is not None:
+                scores = scores + additive_gate[det_s:det_e, :]
+
+            probs = torch.nn.functional.softmax(scores, dim=-1, dtype=torch.float32).to(q_det.dtype)
+            det_to_patch = probs[:, :, :, patch_s:patch_e].mean(dim=1)
+            return det_to_patch
     
     @torch.jit.ignore
     def get_blocks(self):

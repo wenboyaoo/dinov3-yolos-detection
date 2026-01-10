@@ -147,7 +147,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def coco_evaluate(model, criterion, postprocessors, data_loader, base_ds, device, epoch: Optional[int] = None, tb_writer: Optional[SummaryWriter] = None, **kwargs):
+def coco_evaluate(model, criterion, postprocessors, data_loader, base_ds, device, epoch: Optional[int] = None, tb_writer: Optional[SummaryWriter] = None, collect_stats: bool = False, output_dir: Optional[str] = None, use_bf16: bool = False, **kwargs):
     model.eval()
     criterion.eval()
 
@@ -156,7 +156,7 @@ def coco_evaluate(model, criterion, postprocessors, data_loader, base_ds, device
     header = 'Test:'
 
     iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessors.keys())
-    coco_evaluator = CocoEvaluator(base_ds, iou_types)
+    coco_evaluator = CocoEvaluator(base_ds, iou_types, collect_stats=collect_stats)
     # coco_evaluator.coco_eval[iou_types[0]].params.iouThrs = [0, 0.1, 0.5, 0.75]
 
 
@@ -164,7 +164,10 @@ def coco_evaluate(model, criterion, postprocessors, data_loader, base_ds, device
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        outputs = model(samples)
+
+        amp_enabled = bool(use_bf16) and device.type == 'cuda'
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=amp_enabled):
+            outputs = model(samples, collect_attn_stats=collect_stats)
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
@@ -186,7 +189,29 @@ def coco_evaluate(model, criterion, postprocessors, data_loader, base_ds, device
             results = postprocessors['segm'](results, outputs, orig_target_sizes, target_sizes)
         res = {target['image_id'].item(): output for target, output in zip(targets, results)}
         if coco_evaluator is not None:
+            if collect_stats:
+                attns = None
+                if isinstance(outputs, dict):
+                    attns = outputs.get('det_to_patch_attn_layers', None)
+                    if attns is None:
+                        attns = outputs.get('det_to_patch_attn', None)
+                try:
+                    coco_evaluator.maybe_collect_sample_visuals(samples=samples, targets=targets, results=results, attns=attns)
+                except Exception:
+                    pass
             coco_evaluator.update(res)
+
+            if collect_stats:
+                # Collect last-layer attention (det->patch) heatmaps.
+                # This is computed during the main forward and moved to CPU immediately.
+                if attns is not None:
+                    coco_evaluator.update_attentions(attns=attns, samples=samples)
+
+        if mem_debug:
+            allocated = torch.cuda.memory_allocated(device) / (1024**3)
+            reserved = torch.cuda.memory_reserved(device) / (1024**3)
+            max_alloc = torch.cuda.max_memory_allocated(device) / (1024**3)
+            print(f"[CUDA][post] alloc={allocated:.2f}GiB reserved={reserved:.2f}GiB max={max_alloc:.2f}GiB")
 
 
     # gather the stats from all processes
@@ -199,6 +224,14 @@ def coco_evaluate(model, criterion, postprocessors, data_loader, base_ds, device
     if coco_evaluator is not None:
         coco_evaluator.accumulate()
         coco_evaluator.summarize()
+        
+        if collect_stats and output_dir and utils.is_main_process():
+            # NOTE: despite the name, this only exports visualization PNGs.
+            stats_dir = os.path.join(output_dir, "stats")
+            os.makedirs(stats_dir, exist_ok=True)
+            print(f"[stats] exporting visualizations to: {stats_dir}")
+            coco_evaluator.export_stats_to_csv(stats_dir)
+    
     panoptic_res = None
     stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
     if coco_evaluator is not None:

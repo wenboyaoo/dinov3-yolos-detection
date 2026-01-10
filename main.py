@@ -41,6 +41,7 @@ def get_args_parser():
     parser.add_argument('--eval-size', default=800, type=int)
     parser.add_argument('--eval-during-training', action='store_true')
     parser.add_argument('--eval-epochs', default=1, type=int)
+    parser.add_argument('--collect-pred-stats', action='store_true')
     # scheduler
     # Learning rate schedule parameters
     parser.add_argument('--sched', default='warmupcos', type=str, metavar='SCHEDULER',
@@ -85,6 +86,12 @@ def get_args_parser():
                         help="L1 box coefficient in the matching cost")
     parser.add_argument('--set-cost-giou', default=2, type=float,
                         help="giou box coefficient in the matching cost")
+
+    # * Optional backup matching (many-to-one positives after Hungarian)
+    parser.add_argument('--enable-backup-matching', action='store_true',
+                        help='Enable a second-pass backup matching for additional positives')
+    parser.add_argument('--backup-iou-thresh', default=0.7, type=float,
+                        help='IoU threshold for backup matching (same predicted class required)')
     # * Loss coefficients
     parser.add_argument('--ce-loss-coef', default=1, type=float)
     parser.add_argument('--bbox-loss-coef', default=5, type=float)
@@ -186,23 +193,7 @@ def main(args):
     dataset_base = build_dataset(image_set='base', args=args)
 
     # import pdb;pdb.set_trace()
-    if args.balance_traning_dataset:
-        weights, _, _ = build_image_weights(
-            dataset_train,
-            alpha=0.5,
-            cap=10.0,
-            agg="max",
-        )
-        w = np.array(weights, dtype=np.float64)
-        weights = (w / w.min()).tolist()
-        w = np.array(weights)
-        sampler_train = torch.utils.data.WeightedRandomSampler(
-            weights=weights,
-            num_samples=len(dataset_train),
-            replacement=True,
-        )
-    else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+    sampler_train = torch.utils.data.RandomSampler(dataset_train)
     sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
     batch_sampler_train = torch.utils.data.BatchSampler(
@@ -231,7 +222,20 @@ def main(args):
             args.start_epoch = checkpoint['epoch'] + 1
 
     if args.eval:
-        test_stats, evaluator_obj = evaluate(evaluator=args.evaluator, model=model, criterion=criterion, postprocessors=postprocessors, data_loader=data_loader_val, base_ds=base_ds, device=device, epoch=args.start_epoch-1, tb_writer=tb_writer)
+        test_stats, evaluator_obj = evaluate(
+            evaluator=args.evaluator,
+            model=model,
+            criterion=criterion,
+            postprocessors=postprocessors,
+            data_loader=data_loader_val,
+            base_ds=base_ds,
+            device=device,
+            epoch=args.start_epoch - 1,
+            tb_writer=tb_writer,
+            collect_stats=args.collect_pred_stats,
+            output_dir=args.output_dir,
+            use_bf16=args.bf16,
+        )
         if args.output_dir and args.evaluator == 'coco' and evaluator_obj is not None:
             utils.save_on_master(evaluator_obj.coco_eval["bbox"].eval, output_dir / "eval.pth")
         if tb_writer is not None:
@@ -266,7 +270,20 @@ def main(args):
         
         do_eval = args.eval_during_training and ((epoch + 1) % args.eval_epochs == 0 or (epoch + 1) == args.epochs)
         if do_eval:
-            test_stats, evaluator_obj = evaluate(evaluator=args.evaluator, model=model, criterion=criterion, postprocessors=postprocessors, data_loader=data_loader_val, base_ds=base_ds, device=device, epoch=epoch, tb_writer=tb_writer)
+            test_stats, evaluator_obj = evaluate(
+                evaluator=args.evaluator,
+                model=model,
+                criterion=criterion,
+                postprocessors=postprocessors,
+                data_loader=data_loader_val,
+                base_ds=base_ds,
+                device=device,
+                epoch=epoch,
+                tb_writer=tb_writer,
+                collect_stats=False,
+                output_dir=args.output_dir,
+                use_bf16=args.bf16,
+            )
             log_stats = {**{f'test_{k}': v for k, v in test_stats.items()},
                         'epoch': epoch,
                         'n_parameters': n_parameters}

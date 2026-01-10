@@ -6,39 +6,72 @@ Mostly copy-paste from https://github.com/pytorch/vision/blob/edfd5a7/references
 The difference is that there is less copy-pasting from pycocotools
 in the end of the file, as python3 can suppress prints with contextlib
 """
-import os
 import contextlib
 import copy
+import os
+from typing import Optional
+
 import numpy as np
-import torch
-
-from pycocotools.cocoeval import COCOeval
-from pycocotools.coco import COCO
 import pycocotools.mask as mask_util
+import torch
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
 
-from util.misc import all_gather
+from util.misc import all_gather, is_main_process
 
 
 class CocoEvaluator(object):
-    def __init__(self, coco_gt, iou_types):
+    def __init__(self, coco_gt, iou_types, collect_stats: bool = False):
         assert isinstance(iou_types, (list, tuple))
         coco_gt = copy.deepcopy(coco_gt)
         self.coco_gt = coco_gt
         if 'info' not in self.coco_gt.dataset:
-                self.coco_gt.dataset['info'] = {}
+            self.coco_gt.dataset['info'] = {}
         if 'licenses' not in self.coco_gt.dataset:
-                self.coco_gt.dataset['licenses'] = []
-        self.iou_types = iou_types
-        self.coco_eval = {}
-        for iou_type in iou_types:
-            self.coco_eval[iou_type] = COCOeval(coco_gt, iouType=iou_type)
+            self.coco_gt.dataset['licenses'] = []
 
+        self.iou_types = iou_types
+        self.coco_eval = {iou_type: COCOeval(coco_gt, iouType=iou_type) for iou_type in iou_types}
         self.img_ids = []
         self.eval_imgs = {k: [] for k in iou_types}
+
+        # Stats/visualization collector (lazy loaded, optional).
+        self.collect_stats = bool(collect_stats)
+        self._stats = None
+        if self.collect_stats:
+            try:
+                from .coco_stats import CocoEvaluatorStats
+
+                self._stats = CocoEvaluatorStats(self.coco_gt, self.iou_types, collect_stats=True)
+            except Exception:
+                # If optional deps are missing, we still keep normal COCOeval working.
+                self._stats = None
+                self.collect_stats = False
+
+    def maybe_collect_sample_visuals(self, samples, targets, results, attns=None):
+        if self._stats is None:
+            return
+        return self._stats.maybe_collect_sample_visuals(samples=samples, targets=targets, results=results, attns=attns)
+
+    def update_attentions(self, attns, samples):
+        if self._stats is None:
+            return
+        return self._stats.update_attentions(attns=attns, samples=samples)
+
+    def export_stats_to_csv(self, output_dir='./outputs'):
+        if self._stats is None:
+            return
+        return self._stats.export_stats_to_csv(output_dir)
 
     def update(self, predictions):
         img_ids = list(np.unique(list(predictions.keys())))
         self.img_ids.extend(img_ids)
+
+        if self._stats is not None:
+            try:
+                self._stats._collect_det_token_box_stats(predictions, img_ids)
+            except Exception:
+                pass
 
         for iou_type in self.iou_types:
             results = self.prepare(predictions, iou_type)
@@ -47,18 +80,29 @@ class CocoEvaluator(object):
             with open(os.devnull, 'w') as devnull:
                 with contextlib.redirect_stdout(devnull):
                     coco_dt = COCO.loadRes(self.coco_gt, results) if results else COCO()
-            coco_eval = self.coco_eval[iou_type]
 
+            coco_eval = self.coco_eval[iou_type]
             coco_eval.cocoDt = coco_dt
             coco_eval.params.imgIds = list(img_ids)
-            img_ids, eval_imgs = evaluate(coco_eval)
-
+            _, eval_imgs = evaluate(coco_eval)
             self.eval_imgs[iou_type].append(eval_imgs)
+
+            if self._stats is not None and iou_type == 'bbox':
+                try:
+                    self._stats._collect_det_token_recall_matched_from_eval_imgs(coco_dt, coco_eval, eval_imgs)
+                except Exception:
+                    pass
 
     def synchronize_between_processes(self):
         for iou_type in self.iou_types:
             self.eval_imgs[iou_type] = np.concatenate(self.eval_imgs[iou_type], 2)
             create_common_coco_eval(self.coco_eval[iou_type], self.img_ids, self.eval_imgs[iou_type])
+
+        if self._stats is not None:
+            try:
+                self._stats.synchronize_between_processes()
+            except Exception:
+                pass
 
     def accumulate(self):
         for coco_eval in self.coco_eval.values():
@@ -98,6 +142,7 @@ class CocoEvaluator(object):
                         "category_id": labels[k],
                         "bbox": box,
                         "score": scores[k],
+                        "token_idx": k,
                     }
                     for k, box in enumerate(boxes)
                 ]
@@ -110,10 +155,7 @@ class CocoEvaluator(object):
             if len(prediction) == 0:
                 continue
 
-            scores = prediction["scores"]
-            labels = prediction["labels"]
             masks = prediction["masks"]
-
             masks = masks > 0.5
 
             scores = prediction["scores"].tolist()
@@ -145,12 +187,9 @@ class CocoEvaluator(object):
             if len(prediction) == 0:
                 continue
 
-            boxes = prediction["boxes"]
-            boxes = convert_to_xywh(boxes).tolist()
             scores = prediction["scores"].tolist()
             labels = prediction["labels"].tolist()
-            keypoints = prediction["keypoints"]
-            keypoints = keypoints.flatten(start_dim=1).tolist()
+            keypoints = prediction["keypoints"].flatten(start_dim=1).tolist()
 
             coco_results.extend(
                 [
@@ -211,7 +250,6 @@ class CocoEvaluator(object):
         print()
 
 
-
 def convert_to_xywh(boxes):
     xmin, ymin, xmax, ymax = boxes.unbind(1)
     return torch.stack((xmin, ymin, xmax - xmin, ymax - ymin), dim=1)
@@ -249,25 +287,16 @@ def create_common_coco_eval(coco_eval, img_ids, eval_imgs):
     coco_eval._paramsEval = copy.deepcopy(coco_eval.params)
 
 
-#################################################################
-# From pycocotools, just removed the prints and fixed
-# a Python3 bug about unicode not defined
-#################################################################
-
-
-def evaluate(self):
+def evaluate(self, *args, **kwargs):
     '''
     Run per image evaluation on given images and store results (a list of dict) in self.evalImgs
     :return: None
     '''
-    # tic = time.time()
-    # print('Running per image evaluation...')
     p = self.params
     # add backward compatibility if useSegm is specified in params
     if p.useSegm is not None:
         p.iouType = 'segm' if p.useSegm == 1 else 'bbox'
         print('useSegm (deprecated) is not None. Running {} evaluation'.format(p.iouType))
-    # print('Evaluate annotation type *{}*'.format(p.iouType))
     p.imgIds = list(np.unique(p.imgIds))
     if p.useCats:
         p.catIds = list(np.unique(p.catIds))
@@ -298,10 +327,4 @@ def evaluate(self):
     # this is NOT in the pycocotools code, but could be done outside
     evalImgs = np.asarray(evalImgs).reshape(len(catIds), len(p.areaRng), len(p.imgIds))
     self._paramsEval = copy.deepcopy(self.params)
-    # toc = time.time()
-    # print('DONE (t={:0.2f}s).'.format(toc-tic))
     return p.imgIds, evalImgs
-
-#################################################################
-# end of straight copy from pycocotools, just removing the prints
-#################################################################
