@@ -87,11 +87,6 @@ def get_args_parser():
     parser.add_argument('--set-cost-giou', default=2, type=float,
                         help="giou box coefficient in the matching cost")
 
-    # * Optional backup matching (many-to-one positives after Hungarian)
-    parser.add_argument('--enable-backup-matching', action='store_true',
-                        help='Enable a second-pass backup matching for additional positives')
-    parser.add_argument('--backup-iou-thresh', default=0.7, type=float,
-                        help='IoU threshold for backup matching (same predicted class required)')
     # * Loss coefficients
     parser.add_argument('--ce-loss-coef', default=1, type=float)
     parser.add_argument('--bbox-loss-coef', default=5, type=float)
@@ -130,7 +125,9 @@ def load_config(path, args, cli_args):
         cfg = yaml.safe_load(f) or {}
     
     for k, v in cfg.items():
-        if v is not None and k not in cli_args:
+        if v is None:
+            continue
+        if k not in cli_args:
             setattr(args, k, v)
     
     return args

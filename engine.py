@@ -104,11 +104,16 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
+
+        log_weight_dict = getattr(criterion, 'log_weight_dict', weight_dict)
+        loss_dict_reduced_scaled_total = {k: v * weight_dict[k]
+                          for k, v in loss_dict_reduced.items() if k in weight_dict}
+        losses_reduced_scaled = sum(loss_dict_reduced_scaled_total.values())
+
         loss_dict_reduced_unscaled = {f'{k}_unscaled': v
-                                      for k, v in loss_dict_reduced.items()}
-        loss_dict_reduced_scaled = {k: v * weight_dict[k]
-                                    for k, v in loss_dict_reduced.items() if k in weight_dict}
-        losses_reduced_scaled = sum(loss_dict_reduced_scaled.values())
+                  for k, v in loss_dict_reduced.items()}
+        loss_dict_reduced_scaled = {k: v * log_weight_dict[k]
+                for k, v in loss_dict_reduced.items() if k in log_weight_dict}
 
         loss_value = losses_reduced_scaled.item()
 
@@ -173,13 +178,18 @@ def coco_evaluate(model, criterion, postprocessors, data_loader, base_ds, device
 
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
-        loss_dict_reduced_scaled = {k: v * weight_dict[k]
-                                    for k, v in loss_dict_reduced.items() if k in weight_dict}
+
+        log_weight_dict = getattr(criterion, 'log_weight_dict', weight_dict)
+        loss_dict_reduced_scaled_total = {k: v * weight_dict[k]
+                  for k, v in loss_dict_reduced.items() if k in weight_dict}
         loss_dict_reduced_unscaled = {f'{k}_unscaled': v
-                                      for k, v in loss_dict_reduced.items()}
-        metric_logger.update(loss=sum(loss_dict_reduced_scaled.values()),
-                             **loss_dict_reduced_scaled,
-                             **loss_dict_reduced_unscaled)
+                  for k, v in loss_dict_reduced.items()}
+        loss_dict_reduced_scaled = {k: v * log_weight_dict[k]
+                for k, v in loss_dict_reduced.items() if k in log_weight_dict}
+
+        metric_logger.update(loss=sum(loss_dict_reduced_scaled_total.values()),
+                     **loss_dict_reduced_scaled,
+                     **loss_dict_reduced_unscaled)
         metric_logger.update(class_error=loss_dict_reduced['class_error'])
 
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
@@ -206,13 +216,6 @@ def coco_evaluate(model, criterion, postprocessors, data_loader, base_ds, device
                 # This is computed during the main forward and moved to CPU immediately.
                 if attns is not None:
                     coco_evaluator.update_attentions(attns=attns, samples=samples)
-
-        if mem_debug:
-            allocated = torch.cuda.memory_allocated(device) / (1024**3)
-            reserved = torch.cuda.memory_reserved(device) / (1024**3)
-            max_alloc = torch.cuda.max_memory_allocated(device) / (1024**3)
-            print(f"[CUDA][post] alloc={allocated:.2f}GiB reserved={reserved:.2f}GiB max={max_alloc:.2f}GiB")
-
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
