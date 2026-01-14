@@ -66,3 +66,6 @@ num_workers: 64
 det_token_gate: # ['block_non_det_read_det', 'block_all_read_det']
 enable_det_rope: False
 enable_det_additive_embed: False
+backup_matching: False
+backup_k_scale: 0.2
+backup_top_k: 5
