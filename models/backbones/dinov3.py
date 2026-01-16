@@ -502,8 +502,6 @@ def apply_rotary_pos_emb(
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
 
-    # Memory optimization: avoid split+cat which allocates full-size tensors.
-    # Operate directly on the token slice.
     q_tokens = q[..., start:end, :]
     k_tokens = k[..., start:end, :]
 
@@ -514,16 +512,18 @@ def apply_rotary_pos_emb(
     q_rot = (q_tokens * cos) + (rotate_half(q_tokens) * sin)
     k_rot = (k_tokens * cos) + (rotate_half(k_tokens) * sin)
 
-    q[..., start:end, :] = q_rot
-    k[..., start:end, :] = k_rot
+    q_out = q.clone()
+    k_out = k.clone()
+    q_out[..., start:end, :] = q_rot
+    k_out[..., start:end, :] = k_rot
 
-    return q, k
+    return q_out, k_out
 
 def apply_det_temperature(
     q: torch.Tensor, k: torch.Tensor, ph_pw: tuple[torch.Tensor, torch.Tensor], p_scale: float,
     start: int, end: int, **kwargs
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Memory optimization: avoid split+cat which allocates full-size tensors.
+    # IMPORTANT: do NOT scale slices in-place on `q`/`k` views (AsStrided).
     q_tokens = q[..., start:end, :]
     k_tokens = k[..., start:end, :]
     half_len = q.shape[-1] // 2
@@ -547,13 +547,21 @@ def apply_det_temperature(
     tem_h = _norm_tem(tem_h).to(device=q_tokens.device, dtype=q_tokens.dtype)
     tem_w = _norm_tem(tem_w).to(device=q_tokens.device, dtype=q_tokens.dtype)
 
-    # Scale the two halves in-place to avoid concatenation.
-    q_tokens[..., :half_len] = q_tokens[..., :half_len] * tem_h
-    q_tokens[..., half_len:] = q_tokens[..., half_len:] * tem_w
-    k_tokens[..., :half_len] = k_tokens[..., :half_len] * tem_h
-    k_tokens[..., half_len:] = k_tokens[..., half_len:] * tem_w
+    q_scaled = torch.cat(
+        (q_tokens[..., :half_len] * tem_h, q_tokens[..., half_len:] * tem_w),
+        dim=-1,
+    )
+    k_scaled = torch.cat(
+        (k_tokens[..., :half_len] * tem_h, k_tokens[..., half_len:] * tem_w),
+        dim=-1,
+    )
 
-    return q, k
+    q_out = q.clone()
+    k_out = k.clone()
+    q_out[..., start:end, :] = q_scaled
+    k_out[..., start:end, :] = k_scaled
+
+    return q_out, k_out
 
 
 def rotate_half(x):
