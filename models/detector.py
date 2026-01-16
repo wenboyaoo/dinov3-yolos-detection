@@ -55,11 +55,39 @@ class Detector(nn.Module):
         # import pdb;pdb.set_trace()
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
-        x = self.backbone(samples.tensors)
+        backbone_out = self.backbone(samples.tensors)
+        if isinstance(backbone_out, dict):
+            x = backbone_out["det_tokens"]
+            aux_det_tokens = backbone_out.get("aux_det_tokens", None)
+            aux_rope_yx = backbone_out.get("aux_rope_yx", None)
+        else:
+            x = backbone_out
+            aux_det_tokens = None
+            aux_rope_yx = None
+
         outputs_class = self.class_embed(x)
         outputs_coord = self.bbox_embed(x).sigmoid()
         out = {'pred_logits': outputs_class, 'pred_boxes': outputs_coord}
+
+        if self.training and aux_det_tokens is not None and len(aux_det_tokens) > 0:
+            aux_outputs = []
+            for tok in aux_det_tokens:
+                aux_logits = self._mlp_forward_detached_params(self.class_embed, tok)
+                aux_boxes = self._mlp_forward_detached_params(self.bbox_embed, tok).sigmoid()
+                aux_outputs.append({'pred_logits': aux_logits, 'pred_boxes': aux_boxes})
+            out['aux_outputs'] = aux_outputs
+            out['aux_rope_yx'] = aux_rope_yx
         return out
+
+    @staticmethod
+    def _mlp_forward_detached_params(mlp: MLP, x: torch.Tensor) -> torch.Tensor:
+        for i, layer in enumerate(mlp.layers):
+            weight = layer.weight.detach()
+            bias = layer.bias.detach() if layer.bias is not None else None
+            x = F.linear(x, weight, bias)
+            if i < mlp.num_layers - 1:
+                x = F.relu(x)
+        return x
     
     @torch.jit.ignore
     def get_attentions(self, samples: NestedTensor):
@@ -328,6 +356,67 @@ class SetCriterion(nn.Module):
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
+    def _loss_labels_hard(self, outputs, targets, indices, num_boxes, log=False):
+        assert 'pred_logits' in outputs
+        src_logits = outputs['pred_logits']
+        idx = self._get_src_permutation_idx(indices)
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
+                                    dtype=torch.int64, device=src_logits.device)
+        target_classes[idx] = target_classes_o
+
+        empty_weight = self.empty_weight.to(dtype=src_logits.dtype, device=src_logits.device)
+        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, empty_weight)
+        losses = {'loss_ce': loss_ce}
+        if log:
+            if idx[0].numel() > 0:
+                losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
+            else:
+                losses['class_error'] = torch.tensor(0.0, device=src_logits.device)
+        return losses
+
+    def _loss_boxes_hard(self, outputs, targets, indices, num_boxes):
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs['pred_boxes'][idx]
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+        losses = {}
+        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
+
+        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
+            box_ops.box_cxcywh_to_xyxy(src_boxes),
+            box_ops.box_cxcywh_to_xyxy(target_boxes)))
+        losses['loss_giou'] = loss_giou.sum() / num_boxes
+        return losses
+
+    def _loss_rope_center(self, aux_rope_xy, targets, indices, num_boxes):
+        if aux_rope_xy is None:
+            device = targets[0]['boxes'].device if len(targets) > 0 and 'boxes' in targets[0] else self.empty_weight.device
+            return {'loss_rope_center': torch.tensor(0.0, device=device)}
+
+        batch_idx, src_idx = self._get_src_permutation_idx(indices)
+        if batch_idx.numel() == 0:
+            device = aux_rope_xy[0].device if isinstance(aux_rope_xy, list) and len(aux_rope_xy) > 0 else self.empty_weight.device
+            return {'loss_rope_center': torch.tensor(0.0, device=device)}
+
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        # targets boxes are (cx, cy, w, h) in [0,1]; rope coords are (y, x) in [-1,1]
+        target_yx = target_boxes[:, [1, 0]] * 2.0 - 1.0
+
+        total = torch.tensor(0.0, device=target_boxes.device)
+        count = 0
+        for rope_xy in aux_rope_xy:
+            pred_yx = rope_xy[batch_idx, src_idx, :]
+            total = total + F.l1_loss(pred_yx, target_yx, reduction='sum') / num_boxes
+            count += 1
+
+        if count == 0:
+            return {'loss_rope_center': torch.tensor(0.0, device=target_boxes.device)}
+
+        return {'loss_rope_center': total / float(count)}
+
     def forward(self, outputs, targets):
         """ This performs the loss computation.
         Parameters:
@@ -335,7 +424,7 @@ class SetCriterion(nn.Module):
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
-        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+        outputs_without_aux = {k: v for k, v in outputs.items() if k not in ('aux_outputs', 'aux_rope_yx')}
 
         # Retrieve the matching between the outputs of the last layer and the targets
         match_results = self.matcher(outputs_without_aux, targets)
@@ -368,36 +457,29 @@ class SetCriterion(nn.Module):
         
         losses.update(self.loss_cardinality(outputs, targets, indices_h, num_boxes_log))
 
-        # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
-        if 'aux_outputs' in outputs:
-            for i, aux_outputs in enumerate(outputs['aux_outputs']):
-                # NOTE: current training config does not use auxiliary decoder losses.
-                # We keep this block for compatibility.
-                
-                aux_match_results = self.matcher(aux_outputs, targets)
-                if self.matcher.backup_matching:
-                    indices = aux_match_results['indices']
-                    aux_weights = aux_match_results['weights']
-                    aux_bg_weights = aux_match_results['bg_weights']
-                else:
-                    indices = aux_match_results
-                    aux_weights = None
-                    aux_bg_weights = None
+        # Training-time auxiliary losses: reuse last-layer Hungarian indices.
+        if 'aux_outputs' in outputs and outputs['aux_outputs'] is not None:
+            aux_loss_ce = 0.0
+            aux_loss_bbox = 0.0
+            aux_loss_giou = 0.0
+            n_aux = 0
 
-                for loss in self.losses:
-                    if loss == 'masks':
-                        continue
-                    kwargs = {}
-                    if loss == 'labels':
-                        kwargs = {'log': False}
-                        if self.matcher.backup_matching:
-                            kwargs.update({'weights': aux_weights, 'bg_weights': aux_bg_weights})
-                    if loss == 'boxes' and self.matcher.backup_matching:
-                        kwargs.update({'weights': aux_weights, 'bg_weights': aux_bg_weights})
+            for aux_out in outputs['aux_outputs']:
+                aux_loss_ce = aux_loss_ce + self._loss_labels_hard(aux_out, targets, indices_h, num_boxes_log, log=False)['loss_ce']
+                box_losses = self._loss_boxes_hard(aux_out, targets, indices_h, num_boxes_log)
+                aux_loss_bbox = aux_loss_bbox + box_losses['loss_bbox']
+                aux_loss_giou = aux_loss_giou + box_losses['loss_giou']
+                n_aux += 1
 
-                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes_log, **kwargs)
-                    l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
-                    losses.update(l_dict)
+            if n_aux > 0:
+                losses['loss_aux_ce'] = aux_loss_ce / float(n_aux)
+                losses['loss_aux_bbox'] = aux_loss_bbox / float(n_aux)
+                losses['loss_aux_giou'] = aux_loss_giou / float(n_aux)
+
+        # Rope center alignment loss (matched queries only).
+        if 'aux_rope_yx' in outputs:
+            aux_rope_yx = outputs.get('aux_rope_yx', None)
+            losses.update(self._loss_rope_center(aux_rope_yx, targets, indices_h, num_boxes_log))
 
         return losses
 
@@ -442,6 +524,17 @@ def build(args):
         'loss_bbox': args.bbox_loss_coef,
         'loss_giou': args.giou_loss_coef,
     }
+
+    # Aux det losses reuse last-layer Hungarian indices (training-time only).
+    if getattr(args, 'aux_loss_coef', 0.0) and args.aux_loss_coef != 0.0:
+        weight_dict.update({
+            'loss_aux_ce': args.aux_loss_coef * args.ce_loss_coef,
+            'loss_aux_bbox': args.aux_loss_coef * args.bbox_loss_coef,
+            'loss_aux_giou': args.aux_loss_coef * args.giou_loss_coef,
+        })
+
+    if getattr(args, 'rope_center_loss_coef', 0.0) and args.rope_center_loss_coef != 0.0:
+        weight_dict['loss_rope_center'] = args.rope_center_loss_coef
     # TODO this is a hack
     # if args.aux_loss:
     #     aux_weight_dict = {}

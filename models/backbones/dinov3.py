@@ -1002,6 +1002,13 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
 
         attention_gate = get_det_gate(gate_type=self.det_token_gate ,info=batch_info)
         patch_position_embeddings = self.rope_embeddings(batch_info)
+
+        aux_layer_ids = (2, 5, 8)
+        aux_det_tokens = []
+        aux_rope_yx = []
+
+        self.aux_det_tokens = None
+        self.aux_rope_yx = None
         
         # For adaptive det RoPE, keep a per-forward, per-batch rope state.
         rope_params = None
@@ -1049,6 +1056,10 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
                         marginal_attn=marginal_attn,
                         det_tokens=det_tokens_for_updater,
                     )
+
+                    if self.training and i in aux_layer_ids:
+                        aux_det_tokens.append(hidden_states[:, det_s:det_e, :])
+                        aux_rope_yx.append(rope_params[..., :2])
                 else:
                     hidden_states = layer_module(
                         hidden_states= hidden_states,
@@ -1072,6 +1083,10 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         sequence_output = self.norm(hidden_states)
         pooled_output = sequence_output[:, 0, :]
 
+        if self.training and self.enable_det_rope and self.det_rope_type == "adaptive":
+            self.aux_det_tokens = aux_det_tokens if len(aux_det_tokens) > 0 else None
+            self.aux_rope_xy = aux_rope_yx if len(aux_rope_yx) > 0 else None
+
         return BaseModelOutputWithPooling(
             last_hidden_state=sequence_output,
             pooler_output=pooled_output,
@@ -1085,7 +1100,15 @@ class DINOv3Backbone(DINOv3ViTModel):
 
     def forward(self, x):
         out = super().forward(x)
-        return out.last_hidden_state[:, -self.config.num_det_tokens:,:]
+        det_tokens = out.last_hidden_state[:, -self.config.num_det_tokens:, :]
+
+        aux_det_tokens = getattr(self, "aux_det_tokens", None)
+        aux_rope_yx = getattr(self, "aux_rope_yx", None)
+        return {
+            "det_tokens": det_tokens,
+            "aux_det_tokens": aux_det_tokens,
+            "aux_rope_yx": aux_rope_yx,
+        }
     
     @torch.jit.ignore
     def get_attentions(self, x):

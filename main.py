@@ -108,6 +108,10 @@ def get_args_parser():
     parser.add_argument('--ce-loss-coef', default=1, type=float)
     parser.add_argument('--bbox-loss-coef', default=5, type=float)
     parser.add_argument('--giou-loss-coef', default=2, type=float)
+    parser.add_argument('--aux-loss-coef', default=1.0, type=float,
+                        help='Overall coefficient for auxiliary det losses (applied to CE/BBox/GIoU)')
+    parser.add_argument('--rope-center-loss-coef', default=0.1, type=float,
+                        help='Coefficient for matched rope (y,x) center alignment loss')
     parser.add_argument('--eos-coef', default=0.1, type=float,
                         help="Relative classification weight of the no-object class")
 

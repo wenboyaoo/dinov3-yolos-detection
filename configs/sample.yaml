@@ -6,7 +6,7 @@ epochs: 75
 clip_max_norm: 0.1
 bf16: True
 eval_during_training: True
-eval_epochs: 5
+eval_epochs: 1
 save_epochs: 15
 
 # scheduler
@@ -78,6 +78,8 @@ attn_proj_dim: 32
 det_mlp_intermediate_size: 64
 max_stride: 0.2
 det_tem_power_scale: 2.0
+aux_loss_coef: 1.0
+rope_center_loss_coef: 0.1
 
 # >>> DEBUG COST RATIO LOGGING (TEMP; safe to delete) >>>
 # Print per-class top-k unmatched cost / cost_min ratios each batch (k=1,5,10).
