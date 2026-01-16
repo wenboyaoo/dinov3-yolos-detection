@@ -51,18 +51,14 @@ class Detector(nn.Module):
                         p.requires_grad = True
                         break
     
-    def forward(self, samples: NestedTensor, collect_attn_stats: bool = False):
+    def forward(self, samples: NestedTensor):
         # import pdb;pdb.set_trace()
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
-        x = self.backbone(samples.tensors, collect_det_to_patch_attn=collect_attn_stats)
+        x = self.backbone(samples.tensors)
         outputs_class = self.class_embed(x)
         outputs_coord = self.bbox_embed(x).sigmoid()
         out = {'pred_logits': outputs_class, 'pred_boxes': outputs_coord}
-        if collect_attn_stats and hasattr(self.backbone, 'pop_last_det_to_patch_attn_meanheads_cpu'):
-            out['det_to_patch_attn'] = self.backbone.pop_last_det_to_patch_attn_meanheads_cpu()
-        if collect_attn_stats and hasattr(self.backbone, 'pop_det_to_patch_attn_meanheads_cpu_layers'):
-            out['det_to_patch_attn_layers'] = self.backbone.pop_det_to_patch_attn_meanheads_cpu_layers()
         return out
     
     @torch.jit.ignore
@@ -71,18 +67,6 @@ class Detector(nn.Module):
             samples = nested_tensor_from_tensor_list(samples)
         x = self.backbone.get_attentions(samples.tensors)
         return x
-
-    @torch.jit.ignore
-    def get_last_layer_det_to_patch_attn_meanheads(self, samples: NestedTensor):
-        """Memory-friendly last-layer det→patch attention (mean heads).
-
-        Returns a tensor of shape [B, num_det_tokens, num_patches].
-        """
-        if isinstance(samples, (list, torch.Tensor)):
-            samples = nested_tensor_from_tensor_list(samples)
-        if not hasattr(self.backbone, 'get_last_layer_det_to_patch_attn_meanheads'):
-            raise AttributeError('backbone does not implement get_last_layer_det_to_patch_attn_meanheads')
-        return self.backbone.get_last_layer_det_to_patch_attn_meanheads(samples.tensors)
 
 class SetCriterion(nn.Module):
     """ This class computes the loss for DETR.
@@ -124,48 +108,53 @@ class SetCriterion(nn.Module):
         src_logits = outputs['pred_logits']
         
         if self.matcher.backup_matching:
-            # Backup matching logic
-            bs, n_dt, n_class = src_logits.shape
-            
-            # Concatenate all target labels and boxes from the batch
+            # Backup matching logic (VRAM-friendly):
+            # - avoid building a [B, C, Ndt, Ngt] tensor for cross_entropy
+            # - use log_softmax + gather
+            bs, n_dt, _ = src_logits.shape
+
+            # Concatenate all target labels from the batch
             tgt_labels = torch.cat([t["labels"] for t in targets])
-            
-            # Create target classes for positive loss calculation
-            # Shape: [n_dt, n_gt_total]
-            tgt_classes_pos = tgt_labels.unsqueeze(0).expand(n_dt, -1)
+            n_gt_total = int(tgt_labels.numel())
 
-            # Calculate positive loss (for each DT against each GT)
-            # The loss is calculated as if each DT is a positive for each GT
-            # Shape: [bs, n_dt, n_gt_total]
-            loss_ce_pos = F.cross_entropy(src_logits.unsqueeze(2).expand(-1, -1, len(tgt_labels), -1).transpose(2, 3), 
-                                          tgt_classes_pos.unsqueeze(0).expand(bs, -1, -1), 
-                                          self.empty_weight, reduction='none')
-            
-            # Apply the positive weights
-            # weights shape: [bs, n_dt, n_gt_total]
-            weighted_pos_loss = (loss_ce_pos * weights).sum()
+            # Ensure dtype/device
+            tgt_labels = tgt_labels.to(device=src_logits.device, dtype=torch.long)
 
-            # Create target classes for negative loss calculation (all background)
-            tgt_classes_neg = torch.full(src_logits.shape[:2], self.num_classes,
-                                         dtype=torch.int64, device=src_logits.device)
-            
-            # Calculate negative loss (for each DT as background)
-            # Shape: [bs, n_dt]
-            loss_ce_neg = F.cross_entropy(src_logits.transpose(1, 2), tgt_classes_neg, self.empty_weight, reduction='none')
+            # log_probs: [B, Ndt, C]
+            log_probs = F.log_softmax(src_logits, dim=-1)
 
-            # Apply the background weights
-            # bg_weights shape: [bs, n_dt]
-            weighted_neg_loss = (loss_ce_neg * bg_weights).sum()
-            
+            # --- Negative (no-object) loss ---
+            # nll_bg: [B, Ndt]
+            nll_bg = -log_probs[..., self.num_classes]
+            weighted_neg_loss = (nll_bg * (self.eos_coef * bg_weights)).sum()
+
+            if n_gt_total == 0:
+                # Only background when no GT exists.
+                loss_ce = weighted_neg_loss / num_boxes
+                losses = {'loss_ce': loss_ce}
+                if log:
+                    losses['class_error'] = torch.tensor(0.0, device=src_logits.device)
+                return losses
+
+            # --- Positive loss ---
+            # Build index tensor [B, Ndt, Ngt_total] and gather log-probs at GT classes.
+            tgt_labels_exp = tgt_labels.view(1, 1, -1).expand(bs, n_dt, -1)
+            # gathered_logp: [B, Ndt, Ngt_total]
+            gathered_logp = torch.gather(log_probs, dim=2, index=tgt_labels_exp)
+            pos_nll = -gathered_logp
+            weighted_pos_loss = (pos_nll * weights).sum()
+
             loss_ce = (weighted_pos_loss + weighted_neg_loss) / num_boxes
-            
             losses = {'loss_ce': loss_ce}
 
             # Log class error based on Hungarian matching
             if log:
                 idx = self._get_src_permutation_idx(indices)
-                target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-                losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
+                if len(idx) > 0 and len(idx[0]) > 0:
+                    target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+                    losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
+                else:
+                    losses['class_error'] = torch.tensor(0.0, device=src_logits.device)
 
         else:
             # Original logic
@@ -197,7 +186,7 @@ class SetCriterion(nn.Module):
         losses = {'cardinality_error': card_err}
         return losses
 
-    def loss_boxes(self, outputs, targets, indices, num_boxes, weights=None):
+    def loss_boxes(self, outputs, targets, indices, num_boxes, weights=None, bg_weights=None):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
            The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
@@ -212,24 +201,59 @@ class SetCriterion(nn.Module):
             bs, n_dt, _ = src_boxes.shape
             n_gt_total = tgt_boxes.shape[0]
 
+            if n_gt_total == 0:
+                # No GTs, no box loss
+                return {'loss_bbox': torch.tensor(0.0, device=src_boxes.device), 
+                        'loss_giou': torch.tensor(0.0, device=src_boxes.device)}
+
             # Expand src and tgt boxes to calculate all-pairs losses
             # src_boxes_exp: [bs, n_dt, n_gt_total, 4]
             # tgt_boxes_exp: [bs, n_dt, n_gt_total, 4]
             src_boxes_exp = src_boxes.unsqueeze(2).expand(-1, -1, n_gt_total, -1)
             tgt_boxes_exp = tgt_boxes.unsqueeze(0).unsqueeze(0).expand(bs, n_dt, -1, -1)
 
-            # L1 loss
+            # L1 loss for all pairs
             loss_bbox_all = F.l1_loss(src_boxes_exp, tgt_boxes_exp, reduction='none')
+            # A box should only contribute to loss if it's a foreground object.
+            # The total foreground probability for a DT_j is (1 - bg_weight_j).
+            # The formula is Sum_j( (1-W_bg,j) * Sum_i( W_ij' * L(j,i) ) ), where W_ij' is the normalized weight.
+            # A simpler, equivalent formulation is just to sum the weighted losses, as W_ij is already 0 for background boxes.
             weighted_loss_bbox = (loss_bbox_all * weights.unsqueeze(-1)).sum()
 
-            # GIoU loss
-            # The box_ops functions expect [N, 4], so we need to reshape
-            src_boxes_flat = src_boxes_exp.flatten(0, 2)
-            tgt_boxes_flat = tgt_boxes_exp.flatten(0, 2)
-            loss_giou_all = 1 - torch.diag(box_ops.generalized_box_iou(
-                box_ops.box_cxcywh_to_xyxy(src_boxes_flat),
-                box_ops.box_cxcywh_to_xyxy(tgt_boxes_flat)))
-            loss_giou_all = loss_giou_all.view(bs, n_dt, n_gt_total)
+            # GIoU loss for all pairs (VRAM-friendly): compute aligned GIoU per element,
+            # NOT an NxN matrix from generalized_box_iou.
+            src_xyxy = box_ops.box_cxcywh_to_xyxy(src_boxes_exp)
+            tgt_xyxy = box_ops.box_cxcywh_to_xyxy(tgt_boxes_exp)
+
+            # Compute generalized IoU for aligned pairs (elementwise)
+            # Shapes: [..., 4] -> [...]
+            # Use float32 for stability
+            src_xyxy_f = src_xyxy.float()
+            tgt_xyxy_f = tgt_xyxy.float()
+
+            x1 = torch.maximum(src_xyxy_f[..., 0], tgt_xyxy_f[..., 0])
+            y1 = torch.maximum(src_xyxy_f[..., 1], tgt_xyxy_f[..., 1])
+            x2 = torch.minimum(src_xyxy_f[..., 2], tgt_xyxy_f[..., 2])
+            y2 = torch.minimum(src_xyxy_f[..., 3], tgt_xyxy_f[..., 3])
+            inter_w = (x2 - x1).clamp(min=0)
+            inter_h = (y2 - y1).clamp(min=0)
+            inter = inter_w * inter_h
+
+            area1 = (src_xyxy_f[..., 2] - src_xyxy_f[..., 0]).clamp(min=0) * (src_xyxy_f[..., 3] - src_xyxy_f[..., 1]).clamp(min=0)
+            area2 = (tgt_xyxy_f[..., 2] - tgt_xyxy_f[..., 0]).clamp(min=0) * (tgt_xyxy_f[..., 3] - tgt_xyxy_f[..., 1]).clamp(min=0)
+            union = (area1 + area2 - inter).clamp(min=1e-10)
+            iou = inter / union
+
+            cx1 = torch.minimum(src_xyxy_f[..., 0], tgt_xyxy_f[..., 0])
+            cy1 = torch.minimum(src_xyxy_f[..., 1], tgt_xyxy_f[..., 1])
+            cx2 = torch.maximum(src_xyxy_f[..., 2], tgt_xyxy_f[..., 2])
+            cy2 = torch.maximum(src_xyxy_f[..., 3], tgt_xyxy_f[..., 3])
+            c_w = (cx2 - cx1).clamp(min=0)
+            c_h = (cy2 - cy1).clamp(min=0)
+            area_c = (c_w * c_h).clamp(min=1e-10)
+
+            giou = iou - (area_c - union) / area_c
+            loss_giou_all = (1.0 - giou).to(dtype=src_boxes.dtype)
             weighted_loss_giou = (loss_giou_all * weights).sum()
 
             losses = {}
@@ -337,7 +361,7 @@ class SetCriterion(nn.Module):
         # Log/print: only Hungarian-matched tokens
         if self.matcher.backup_matching:
             losses.update(self.loss_labels(outputs, targets, indices_h, num_boxes_log, log=True, weights=weights, bg_weights=bg_weights))
-            losses.update(self.loss_boxes(outputs, targets, indices_h, num_boxes_log, weights=weights))
+            losses.update(self.loss_boxes(outputs, targets, indices_h, num_boxes_log, weights=weights, bg_weights=bg_weights))
         else:
             losses.update(self.loss_labels(outputs, targets, indices_h, num_boxes_log, log=True))
             losses.update(self.loss_boxes(outputs, targets, indices_h, num_boxes_log))
@@ -369,7 +393,7 @@ class SetCriterion(nn.Module):
                         if self.matcher.backup_matching:
                             kwargs.update({'weights': aux_weights, 'bg_weights': aux_bg_weights})
                     if loss == 'boxes' and self.matcher.backup_matching:
-                        kwargs.update({'weights': aux_weights})
+                        kwargs.update({'weights': aux_weights, 'bg_weights': aux_bg_weights})
 
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes_log, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}

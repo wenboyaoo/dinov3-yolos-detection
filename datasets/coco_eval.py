@@ -21,7 +21,7 @@ from util.misc import all_gather, is_main_process
 
 
 class CocoEvaluator(object):
-    def __init__(self, coco_gt, iou_types, collect_stats: bool = False):
+    def __init__(self, coco_gt, iou_types):
         assert isinstance(iou_types, (list, tuple))
         coco_gt = copy.deepcopy(coco_gt)
         self.coco_gt = coco_gt
@@ -35,43 +35,9 @@ class CocoEvaluator(object):
         self.img_ids = []
         self.eval_imgs = {k: [] for k in iou_types}
 
-        # Stats/visualization collector (lazy loaded, optional).
-        self.collect_stats = bool(collect_stats)
-        self._stats = None
-        if self.collect_stats:
-            try:
-                from .coco_stats import CocoEvaluatorStats
-
-                self._stats = CocoEvaluatorStats(self.coco_gt, self.iou_types, collect_stats=True)
-            except Exception:
-                # If optional deps are missing, we still keep normal COCOeval working.
-                self._stats = None
-                self.collect_stats = False
-
-    def maybe_collect_sample_visuals(self, samples, targets, results, attns=None):
-        if self._stats is None:
-            return
-        return self._stats.maybe_collect_sample_visuals(samples=samples, targets=targets, results=results, attns=attns)
-
-    def update_attentions(self, attns, samples):
-        if self._stats is None:
-            return
-        return self._stats.update_attentions(attns=attns, samples=samples)
-
-    def export_stats_to_csv(self, output_dir='./outputs'):
-        if self._stats is None:
-            return
-        return self._stats.export_stats_to_csv(output_dir)
-
     def update(self, predictions):
         img_ids = list(np.unique(list(predictions.keys())))
         self.img_ids.extend(img_ids)
-
-        if self._stats is not None:
-            try:
-                self._stats._collect_det_token_box_stats(predictions, img_ids)
-            except Exception:
-                pass
 
         for iou_type in self.iou_types:
             results = self.prepare(predictions, iou_type)
@@ -87,22 +53,10 @@ class CocoEvaluator(object):
             _, eval_imgs = evaluate(coco_eval)
             self.eval_imgs[iou_type].append(eval_imgs)
 
-            if self._stats is not None and iou_type == 'bbox':
-                try:
-                    self._stats._collect_det_token_recall_matched_from_eval_imgs(coco_dt, coco_eval, eval_imgs)
-                except Exception:
-                    pass
-
     def synchronize_between_processes(self):
         for iou_type in self.iou_types:
             self.eval_imgs[iou_type] = np.concatenate(self.eval_imgs[iou_type], 2)
             create_common_coco_eval(self.coco_eval[iou_type], self.img_ids, self.eval_imgs[iou_type])
-
-        if self._stats is not None:
-            try:
-                self._stats.synchronize_between_processes()
-            except Exception:
-                pass
 
     def accumulate(self):
         for coco_eval in self.coco_eval.values():

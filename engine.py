@@ -75,7 +75,10 @@ from datasets.coco_eval import CocoEvaluator
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0,
-                    tb_writer: Optional[SummaryWriter] = None, use_bf16: bool = False):
+                    tb_writer: Optional[SummaryWriter] = None, use_bf16: bool = False,
+                    # >>> DEBUG COST RATIO LOGGING (TEMP; safe to delete) >>>
+                    debug_cost_ratio: bool = False):
+                    # <<< DEBUG COST RATIO LOGGING (TEMP; safe to delete) <<<
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -132,6 +135,26 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         metric_logger.update(class_error=loss_dict_reduced['class_error'])
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
+        # >>> DEBUG COST RATIO LOGGING (TEMP; safe to delete) >>>
+        # Print per-class ratio stats computed inside HungarianMatcher.forward().
+        # We print after optimizer.step() to match "end of batch".
+        if debug_cost_ratio and utils.is_main_process():
+            matcher = getattr(criterion, 'matcher', None)
+            stats = getattr(matcher, '_last_debug_cost_ratio_stats', None) if matcher is not None else None
+            if isinstance(stats, dict) and isinstance(stats.get('per_class', None), dict):
+                per_class = stats['per_class']
+                ks = stats.get('ks', (1, 5, 10))
+                if len(per_class) > 0:
+                    parts = []
+                    for cls_id in sorted(per_class.keys()):
+                        entry = per_class[cls_id]
+                        n = entry.get('n', 0)
+                        k_str = ' '.join([f"k{k}={entry.get(k, float('nan')):.3f}" for k in ks])
+                        parts.append(f"cls{cls_id}(n={n}): {k_str}")
+                    msg = f"[DBG cost_ratio] epoch={epoch} batch={batch_idx+1}/{num_batches} | " + ' | '.join(parts)
+                    print(msg)
+        # <<< DEBUG COST RATIO LOGGING (TEMP; safe to delete) <<<
+
         if tb_writer is not None and utils.is_main_process():
             global_step = epoch * num_batches + batch_idx
             tb_writer.add_scalar('train/loss', loss_value, global_step)
@@ -152,7 +175,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def coco_evaluate(model, criterion, postprocessors, data_loader, base_ds, device, epoch: Optional[int] = None, tb_writer: Optional[SummaryWriter] = None, collect_stats: bool = False, output_dir: Optional[str] = None, use_bf16: bool = False, **kwargs):
+def coco_evaluate(model, criterion, postprocessors, data_loader, base_ds, device, epoch: Optional[int] = None, tb_writer: Optional[SummaryWriter] = None, output_dir: Optional[str] = None, use_bf16: bool = False, **kwargs):
     model.eval()
     criterion.eval()
 
@@ -161,7 +184,7 @@ def coco_evaluate(model, criterion, postprocessors, data_loader, base_ds, device
     header = 'Test:'
 
     iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessors.keys())
-    coco_evaluator = CocoEvaluator(base_ds, iou_types, collect_stats=collect_stats)
+    coco_evaluator = CocoEvaluator(base_ds, iou_types)
     # coco_evaluator.coco_eval[iou_types[0]].params.iouThrs = [0, 0.1, 0.5, 0.75]
 
 
@@ -172,7 +195,7 @@ def coco_evaluate(model, criterion, postprocessors, data_loader, base_ds, device
 
         amp_enabled = bool(use_bf16) and device.type == 'cuda'
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=amp_enabled):
-            outputs = model(samples, collect_attn_stats=collect_stats)
+            outputs = model(samples)
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
@@ -199,23 +222,7 @@ def coco_evaluate(model, criterion, postprocessors, data_loader, base_ds, device
             results = postprocessors['segm'](results, outputs, orig_target_sizes, target_sizes)
         res = {target['image_id'].item(): output for target, output in zip(targets, results)}
         if coco_evaluator is not None:
-            if collect_stats:
-                attns = None
-                if isinstance(outputs, dict):
-                    attns = outputs.get('det_to_patch_attn_layers', None)
-                    if attns is None:
-                        attns = outputs.get('det_to_patch_attn', None)
-                try:
-                    coco_evaluator.maybe_collect_sample_visuals(samples=samples, targets=targets, results=results, attns=attns)
-                except Exception:
-                    pass
             coco_evaluator.update(res)
-
-            if collect_stats:
-                # Collect last-layer attention (det->patch) heatmaps.
-                # This is computed during the main forward and moved to CPU immediately.
-                if attns is not None:
-                    coco_evaluator.update_attentions(attns=attns, samples=samples)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -227,13 +234,6 @@ def coco_evaluate(model, criterion, postprocessors, data_loader, base_ds, device
     if coco_evaluator is not None:
         coco_evaluator.accumulate()
         coco_evaluator.summarize()
-        
-        if collect_stats and output_dir and utils.is_main_process():
-            # NOTE: despite the name, this only exports visualization PNGs.
-            stats_dir = os.path.join(output_dir, "stats")
-            os.makedirs(stats_dir, exist_ok=True)
-            print(f"[stats] exporting visualizations to: {stats_dir}")
-            coco_evaluator.export_stats_to_csv(stats_dir)
     
     panoptic_res = None
     stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}

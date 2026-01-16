@@ -41,7 +41,6 @@ def get_args_parser():
     parser.add_argument('--eval-size', default=800, type=int)
     parser.add_argument('--eval-during-training', action='store_true')
     parser.add_argument('--eval-epochs', default=1, type=int)
-    parser.add_argument('--collect-pred-stats', action='store_true')
     # scheduler
     # Learning rate schedule parameters
     parser.add_argument('--sched', default='warmupcos', type=str, metavar='SCHEDULER',
@@ -74,11 +73,29 @@ def get_args_parser():
                         help="Size of the backbone to use"),
     parser.add_argument('--unfreeze', nargs='+', default=[]),
     parser.add_argument('--no-weight-decay', nargs='+', default=[]),
-    parser.add_argument('--pretrained-path', default= None),
+    # backbone weights
+    parser.add_argument('--pretrained', default=None, type=str,
+                        help='Pretrained checkpoint path or HF model id')
     parser.add_argument('--init-pe-size', nargs='+', type=int,
                         help="init pe size (h,w)")
     parser.add_argument('--mid-pe-size', nargs='+', type=int,
                         help="mid pe size (h,w)")
+
+    # * Experiments (det tokens / det RoPE)
+    parser.add_argument('--det-token-gate', default=None, type=str,
+                        help="Det token attention gate: block_non_det_read_det | block_all_read_det")
+    parser.add_argument('--enable-det-rope', action='store_true',
+                        help='Enable det token RoPE')
+    parser.add_argument('--det-rope-type', default='fixed', type=str,
+                        help='Det RoPE type: fixed | learnable | adaptive')
+    parser.add_argument('--token-proj-dim', default=32, type=int)
+    parser.add_argument('--attn-interp-dim', default=50, type=int)
+    parser.add_argument('--attn-proj-dim', default=32, type=int)
+    parser.add_argument('--det-mlp-intermediate-size', default=64, type=int)
+    parser.add_argument('--max-stride', default=0.2, type=float)
+    parser.add_argument('--det-tem-power-scale', default=2.0, type=float)
+    parser.add_argument('--enable-det-additive-embeddings', action='store_true',
+                        help='Enable per-layer additive embeddings for det tokens')
     # * Matcher
     parser.add_argument('--set-cost-class', default=1, type=float,
                         help="Class coefficient in the matching cost")
@@ -98,6 +115,8 @@ def get_args_parser():
     parser.add_argument('--dataset-file', default='coco')
     parser.add_argument('--coco-path', type=str)
     parser.add_argument('--remove-difficult', action='store_true')
+    parser.add_argument('--resize', default=800, type=int,
+                        help='Train/eval resize short side (used by dataset transforms)')
 
     parser.add_argument('--output-dir', default='',
                         help='path where to save, empty for no saving')
@@ -114,6 +133,16 @@ def get_args_parser():
                         help='Enable bfloat16 mixed precision training')
 
     parser.add_argument('--config-file',default=None, help='path to .yaml configuration file')
+    # matcher backup matching options
+    parser.add_argument('--backup-matching', action='store_true')
+    parser.add_argument('--backup-k-scale', default=0.2, type=float)
+    parser.add_argument('--backup-top-k', default=5, type=int)
+    parser.add_argument('--backup-class-ids', nargs='+', type=int, default=[])
+
+    # >>> DEBUG COST RATIO LOGGING (TEMP; safe to delete) >>>
+    parser.add_argument('--debug-cost-ratio', action='store_true',
+                        help='Print per-class top-k unmatched cost / cost_min ratios each batch (k=1,5,10).')
+    # <<< DEBUG COST RATIO LOGGING (TEMP; safe to delete) <<<
     return parser
 
 
@@ -229,7 +258,6 @@ def main(args):
             device=device,
             epoch=args.start_epoch - 1,
             tb_writer=tb_writer,
-            collect_stats=args.collect_pred_stats,
             output_dir=args.output_dir,
             use_bf16=args.bf16,
         )
@@ -244,7 +272,10 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm, tb_writer=tb_writer, use_bf16=args.bf16)
+            args.clip_max_norm, tb_writer=tb_writer, use_bf16=args.bf16,
+            # >>> DEBUG COST RATIO LOGGING (TEMP; safe to delete) >>>
+            debug_cost_ratio=getattr(args, 'debug_cost_ratio', False))
+            # <<< DEBUG COST RATIO LOGGING (TEMP; safe to delete) <<<
         lr_scheduler.step(epoch)
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
@@ -277,7 +308,6 @@ def main(args):
                 device=device,
                 epoch=epoch,
                 tb_writer=tb_writer,
-                collect_stats=False,
                 output_dir=args.output_dir,
                 use_bf16=args.bf16,
             )
