@@ -424,8 +424,7 @@ class DetRopeUpdater(nn.Module):
 
         y = rope_params[..., 0:1]
         x = rope_params[..., 1:2]
-        ph = rope_params[..., 2:3]
-        pw = rope_params[..., 3:4]
+        p = rope_params[..., 2:3]
 
         def _interp_1d(attn_1d: torch.Tensor) -> torch.Tensor:
             if attn_1d.shape[-1] == self.attn_interp_dim:
@@ -441,23 +440,24 @@ class DetRopeUpdater(nn.Module):
         dir_h = torch.zeros((batch_size, num_det, 1), device=device, dtype=dtype)
         dir_w = torch.ones((batch_size, num_det, 1), device=device, dtype=dtype)
 
-        feature_h = torch.cat((dir_h, attn_h_proj, token_proj, y, ph), dim=-1)
-        feature_w = torch.cat((dir_w, attn_w_proj, token_proj, x, pw), dim=-1)
+        feature_h = torch.cat((dir_h, attn_h_proj, token_proj, y, p), dim=-1)
+        feature_w = torch.cat((dir_w, attn_w_proj, token_proj, x, p), dim=-1)
 
         delta_h = self.down_proj(self.act_fn(self.gate_proj(feature_h)) * self.up_proj(feature_h))
         delta_w = self.down_proj(self.act_fn(self.gate_proj(feature_w)) * self.up_proj(feature_w))
 
         d_y = self.max_stride * torch.tanh(delta_h[..., 0:1])
-        d_ph = torch.tanh(delta_h[..., 1:2])
+        d_p_h = torch.tanh(delta_h[..., 1:2])
         d_x = self.max_stride * torch.tanh(delta_w[..., 0:1])
-        d_pw = torch.tanh(delta_w[..., 1:2])
+        d_p_w = torch.tanh(delta_w[..., 1:2])
+
+        d_p = (d_p_h + d_p_w) / 2
 
         y_next = torch.clamp(y + d_y, -1, 1)
         x_next = torch.clamp(x + d_x, -1, 1)
-        ph_next = torch.tanh(ph + d_ph)
-        pw_next = torch.tanh(pw + d_pw)
+        p_next = d_p
 
-        rope_params_next = torch.cat((y_next, x_next, ph_next, pw_next), dim=-1)
+        rope_params_next = torch.cat((y_next, x_next, p_next), dim=-1)
         return rope_params_next
     
 def get_marginal_attn(
@@ -520,19 +520,15 @@ def apply_rotary_pos_emb(
     return q_out, k_out
 
 def apply_det_temperature(
-    q: torch.Tensor, k: torch.Tensor, ph_pw: tuple[torch.Tensor, torch.Tensor], p_scale: float,
+    q: torch.Tensor, k: torch.Tensor, p: torch.Tensor, p_scale: float,
     start: int, end: int, **kwargs
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # IMPORTANT: do NOT scale slices in-place on `q`/`k` views (AsStrided).
     q_tokens = q[..., start:end, :]
     k_tokens = k[..., start:end, :]
-    half_len = q.shape[-1] // 2
 
-    ph, pw = ph_pw
-    ph = ph * p_scale
-    pw = pw * p_scale
-    tem_h = torch.exp(ph)
-    tem_w = torch.exp(pw)
+    p = p * p_scale
+    tem = torch.exp(p)
 
     # Normalize shapes for broadcasting to (B, heads, N, head_dim/2)
     def _norm_tem(t: torch.Tensor) -> torch.Tensor:
@@ -544,17 +540,10 @@ def apply_det_temperature(
             return t.unsqueeze(1)
         return t
 
-    tem_h = _norm_tem(tem_h).to(device=q_tokens.device, dtype=q_tokens.dtype)
-    tem_w = _norm_tem(tem_w).to(device=q_tokens.device, dtype=q_tokens.dtype)
+    tem = _norm_tem(tem).to(device=q_tokens.device, dtype=q_tokens.dtype)
 
-    q_scaled = torch.cat(
-        (q_tokens[..., :half_len] * tem_h, q_tokens[..., half_len:] * tem_w),
-        dim=-1,
-    )
-    k_scaled = torch.cat(
-        (k_tokens[..., :half_len] * tem_h, k_tokens[..., half_len:] * tem_w),
-        dim=-1,
-    )
+    q_scaled = q_tokens * tem
+    k_scaled = k_tokens * tem
 
     q_out = q.clone()
     k_out = k.clone()
@@ -652,7 +641,7 @@ class DINOv3ViTAttention(nn.Module):
         attention_gate: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         patch_position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        det_rope_embeddings: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+		det_rope_embeddings: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 		**kwargs: Any,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Input shape: Batch x Time x Channel"""
@@ -677,9 +666,9 @@ class DINOv3ViTAttention(nn.Module):
             query_states, key_states = apply_rotary_pos_emb(q=query_states, k=key_states, cos_sin=patch_position_embeddings, start=patch_s, end=patch_e)
         if det_rope_embeddings is not None:
             cos_sin = det_rope_embeddings[:2]
-            ph_pw = det_rope_embeddings[2:]
+            p = det_rope_embeddings[2]
             query_states, key_states = apply_rotary_pos_emb(q=query_states, k=key_states, cos_sin=cos_sin, start=det_s, end=det_e)
-            query_states, key_states = apply_det_temperature(q=query_states, k=key_states, ph_pw=ph_pw, p_scale=self.det_tem_power_scale, start=det_s, end=det_e)
+            query_states, key_states = apply_det_temperature(q=query_states, k=key_states, p=p, p_scale=self.det_tem_power_scale, start=det_s, end=det_e)
 
         attention_interface: Callable = eager_attention_forward
 
@@ -800,7 +789,7 @@ class DINOv3ViTLayer(GradientCheckpointingLayer):
         attention_gate: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         patch_position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        det_rope_embeddings: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        det_rope_embeddings: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         output_marginal_attention: bool = False,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         # Attention with residual connection
@@ -938,15 +927,15 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
                 hw = math.isqrt(n)
                 assert hw * hw == n, f"num_det_tokens must be a perfect square, got {n}"
                 coords = get_fixed_det_coordinates(num_h=hw, num_w=hw)
-                params = F.pad(coords, (0, 2), "constant", 0)
+                params = F.pad(coords, (0, 1), "constant", 0)
                 self.register_buffer("det_rope_params", params, persistent=False)
             elif self.det_rope_type == 'learnable':
-                self.det_rope_params = nn.Parameter(torch.empty(self.config.num_hidden_layers, self.config.num_det_tokens, 4))
+                self.det_rope_params = nn.Parameter(torch.empty(self.config.num_hidden_layers, self.config.num_det_tokens, 3))
                 torch.nn.init.uniform_(self.det_rope_params, a=-1, b=1)
                 with torch.no_grad():
                     self.det_rope_params[..., 2:].zero_()
             elif self.det_rope_type == 'adaptive':
-                self.det_rope_params = nn.Parameter(torch.empty(self.config.num_det_tokens, 4))
+                self.det_rope_params = nn.Parameter(torch.empty(self.config.num_det_tokens, 3))
                 self.det_rope_updater = nn.ModuleList([DetRopeUpdater(config) for _ in range(config.num_hidden_layers)])
                 torch.nn.init.uniform_(self.det_rope_params, a=-1, b=1)
                 with torch.no_grad():
@@ -1037,16 +1026,13 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
                     layer_det_rope_param = self.det_rope_params if self.det_rope_params.dim() == 2 else self.det_rope_params[i]
 
                 coords = layer_det_rope_param[..., :2]
-                tem_p = layer_det_rope_param[..., 2:]
-                ph = tem_p[..., 0]
-                pw = tem_p[..., 1]
-                # Normalize ph/pw for broadcasting later
-                if ph.dim() == 1:
-                    ph = ph.view(1, -1)
-                    pw = pw.view(1, -1)
+                p = layer_det_rope_param[..., 2]
+                # Normalize p for broadcasting later
+                if p.dim() == 1:
+                    p = p.view(1, -1)
 
                 cos, sin = self.det_rope(coords, batch_info)
-                det_rope_embeddings = (cos, sin, ph, pw)
+                det_rope_embeddings = (cos, sin, p)
                 if self.det_rope_type == 'adaptive':
                     hidden_states, marginal_attn = layer_module(
                         hidden_states= hidden_states,
@@ -1093,7 +1079,7 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
 
         if self.training and self.enable_det_rope and self.det_rope_type == "adaptive":
             self.aux_det_tokens = aux_det_tokens if len(aux_det_tokens) > 0 else None
-            self.aux_rope_xy = aux_rope_yx if len(aux_rope_yx) > 0 else None
+            self.aux_rope_yx = aux_rope_yx if len(aux_rope_yx) > 0 else None
 
         return BaseModelOutputWithPooling(
             last_hidden_state=sequence_output,
@@ -1135,7 +1121,7 @@ class DINOv3Backbone(DINOv3ViTModel):
         for name in unloaded:
             if name in param_dict:
                 param = param_dict[name]
-                if "det_rope_params" in name.split(".") and param.data.dim() >= 2 and param.data.shape[-1] == 4:
+                if "det_rope_params" in name.split(".") and param.data.dim() >= 2 and param.data.shape[-1] == 3:
                     with torch.no_grad():
                         param.data[..., :2].uniform_(-1, 1)
                         param.data[..., 2:].zero_()

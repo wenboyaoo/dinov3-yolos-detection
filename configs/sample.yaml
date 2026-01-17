@@ -1,13 +1,13 @@
 lr: 8.0e-4
 backbone_lr: 8.0e-5
-batch_size: 32
+batch_size: 16
 weight_decay: 5.0e-4
-epochs: 75
+epochs: 100
 clip_max_norm: 0.1
 bf16: True
 eval_during_training: True
 eval_epochs: 1
-save_epochs: 15
+save_epochs: 25
 
 # scheduler
 sched: warmupcos # options: ["step", "warmupcos"]
@@ -69,8 +69,8 @@ det_token_gate: # ['block_non_det_read_det', 'block_all_read_det']
 ## backup matching
 backup_matching: False
 backup_class_ids: []
-backup_k_scale: 0.2
-backup_top_k: 5
+backup_k_scale: 4
+backup_top_k: 10
 ## det postion embedding
 ### additive
 enable_det_additive_embeddings: False
@@ -78,16 +78,11 @@ enable_det_additive_embeddings: False
 enable_det_rope: False
 det_rope_type: fixed # ['fixed', 'learnable', 'adaptive']
 #### adaptive RoPE
-token_proj_dim: 32
-attn_interp_dim: 50
-attn_proj_dim: 32
-det_mlp_intermediate_size: 64
-max_stride: 0.2
+token_proj_dim: 64
+attn_interp_dim: 64
+attn_proj_dim: 64
+det_mlp_intermediate_size: 128
+max_stride: 0.05
 det_tem_power_scale: 2.0
-aux_loss_coef: 1.0
-rope_center_loss_coef: 0.1
-
-# >>> DEBUG COST RATIO LOGGING (TEMP; safe to delete) >>>
-# Print per-class top-k unmatched cost / cost_min ratios each batch (k=1,5,10).
-debug_cost_ratio: False
-# <<< DEBUG COST RATIO LOGGING (TEMP; safe to delete) <<<
+aux_loss_coef: 0.2
+rope_center_loss_coef: 0.25

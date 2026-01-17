@@ -75,10 +75,7 @@ from datasets.coco_eval import CocoEvaluator
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0,
-                    tb_writer: Optional[SummaryWriter] = None, use_bf16: bool = False,
-                    # >>> DEBUG COST RATIO LOGGING (TEMP; safe to delete) >>>
-                    debug_cost_ratio: bool = False):
-                    # <<< DEBUG COST RATIO LOGGING (TEMP; safe to delete) <<<
+                    tb_writer: Optional[SummaryWriter] = None, use_bf16: bool = False):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -135,25 +132,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         metric_logger.update(class_error=loss_dict_reduced['class_error'])
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
-        # >>> DEBUG COST RATIO LOGGING (TEMP; safe to delete) >>>
-        # Print per-class ratio stats computed inside HungarianMatcher.forward().
-        # We print after optimizer.step() to match "end of batch".
-        if debug_cost_ratio and utils.is_main_process():
-            matcher = getattr(criterion, 'matcher', None)
-            stats = getattr(matcher, '_last_debug_cost_ratio_stats', None) if matcher is not None else None
-            if isinstance(stats, dict) and isinstance(stats.get('per_class', None), dict):
-                per_class = stats['per_class']
-                ks = stats.get('ks', (1, 5, 10))
-                if len(per_class) > 0:
-                    parts = []
-                    for cls_id in sorted(per_class.keys()):
-                        entry = per_class[cls_id]
-                        n = entry.get('n', 0)
-                        k_str = ' '.join([f"k{k}={entry.get(k, float('nan')):.3f}" for k in ks])
-                        parts.append(f"cls{cls_id}(n={n}): {k_str}")
-                    msg = f"[DBG cost_ratio] epoch={epoch} batch={batch_idx+1}/{num_batches} | " + ' | '.join(parts)
-                    print(msg)
-        # <<< DEBUG COST RATIO LOGGING (TEMP; safe to delete) <<<
+
 
         if tb_writer is not None and utils.is_main_process():
             global_step = epoch * num_batches + batch_idx

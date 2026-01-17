@@ -35,12 +35,6 @@ class HungarianMatcher(nn.Module):
         self.backup_matching = backup_matching
         self.backup_k_scale = backup_k_scale
         self.backup_top_k = backup_top_k
-        # >>> DEBUG COST RATIO LOGGING (TEMP; safe to delete) >>>
-        # When enabled, we compute per-class statistics about how far the (unmatched) top-k costs are
-        # from the Hungarian anchor cost_min, and cache the result for the training loop to print.
-        self.debug_cost_ratio = bool(debug_cost_ratio)
-        self._last_debug_cost_ratio_stats = None
-        # <<< DEBUG COST RATIO LOGGING (TEMP; safe to delete) <<<
         if backup_class_ids is None:
             self.backup_class_ids = None
         else:
@@ -136,80 +130,6 @@ class HungarianMatcher(nn.Module):
         C_split_cpu = C.cpu().split(sizes, -1)
         indices = [linear_sum_assignment(c[i]) for i, c in enumerate(C_split_cpu)]
 
-        # >>> DEBUG COST RATIO LOGGING (TEMP; safe to delete) >>>
-        # For each GT (grouped by class), compute ratio:
-        #   ratio_k = (max cost among the top-k smallest unmatched DT costs) / cost_min
-        # Here, "unmatched" means DTs not selected by Hungarian matching.
-        # We compute k in {1,5,10} and average ratios per class.
-        if self.debug_cost_ratio:
-            ks = (1, 5, 10)
-            sums = {k: {} for k in ks}   # sums[k][cls] = float
-            counts = {k: {} for k in ks} # counts[k][cls] = int
-
-            for img_i, (assignment, c_cpu) in enumerate(zip(indices, C_split_cpu)):
-                num_gt_i = sizes[img_i]
-                if num_gt_i == 0:
-                    continue
-
-                # c_img: [num_queries, num_gt_i]
-                c_img = c_cpu[img_i]
-
-                dt_idx_np, gt_idx_np = assignment
-                if len(gt_idx_np) == 0:
-                    continue
-
-                dt_idx = torch.as_tensor(dt_idx_np, dtype=torch.long)
-                gt_idx = torch.as_tensor(gt_idx_np, dtype=torch.long)
-
-                num_dt = int(c_img.shape[0])
-                matched_dt_mask = torch.zeros(num_dt, dtype=torch.bool)
-                matched_dt_mask[dt_idx] = True
-                num_unmatched = int((~matched_dt_mask).sum().item())
-                if num_unmatched == 0:
-                    # No unmatched DTs -> cannot compute top-k over unmatched.
-                    continue
-
-                # cost_min per matched GT (indexed by gt column id)
-                # cost_min_vec: [num_gt_i]
-                cost_min_vec = torch.full((num_gt_i,), float('nan'), dtype=c_img.dtype)
-                cost_min_vec[gt_idx] = c_img[dt_idx, gt_idx].clamp(min=1e-6)
-
-                # Gather unmatched costs: [num_unmatched, num_gt_i]
-                unmatched_costs = c_img[~matched_dt_mask]
-
-                # Target labels for this image: [num_gt_i]
-                labels_i = targets[img_i]["labels"].detach().to(dtype=torch.long, device='cpu')
-
-                for k in ks:
-                    k_eff = min(int(k), num_unmatched)
-                    # kth smallest (1-indexed) among unmatched DTs for each GT column
-                    kth = unmatched_costs.kthvalue(k_eff, dim=0).values
-
-                    # Only consider GTs that are actually matched (have a defined cost_min)
-                    ratio = (kth[gt_idx] / cost_min_vec[gt_idx]).detach().cpu().to(torch.float32)
-                    cls_ids = labels_i[gt_idx].cpu()
-
-                    for r, cls_id in zip(ratio.tolist(), cls_ids.tolist()):
-                        if not (r == r):
-                            continue
-                        prev = sums[k].get(cls_id, 0.0)
-                        sums[k][cls_id] = prev + float(r)
-                        counts[k][cls_id] = counts[k].get(cls_id, 0) + 1
-
-            per_class = {}
-            for k in ks:
-                for cls_id, s in sums[k].items():
-                    n = counts[k].get(cls_id, 0)
-                    if n <= 0:
-                        continue
-                    per_class.setdefault(cls_id, {})[k] = s / n
-                    per_class.setdefault(cls_id, {})["n"] = n
-
-            self._last_debug_cost_ratio_stats = {
-                "ks": ks,
-                "per_class": per_class,
-            }
-        # <<< DEBUG COST RATIO LOGGING (TEMP; safe to delete) <<<
         
         if not self.backup_matching:
             return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
@@ -351,7 +271,4 @@ class HungarianMatcher(nn.Module):
 def build_matcher(args):
     return HungarianMatcher(cost_class=args.set_cost_class, cost_bbox=args.set_cost_bbox, cost_giou=args.set_cost_giou,
                             backup_matching=args.backup_matching, backup_k_scale=args.backup_k_scale, backup_top_k=args.backup_top_k,
-                            backup_class_ids=getattr(args, 'backup_class_ids', []),
-                            # >>> DEBUG COST RATIO LOGGING (TEMP; safe to delete) >>>
-                            debug_cost_ratio=getattr(args, 'debug_cost_ratio', False))
-                            # <<< DEBUG COST RATIO LOGGING (TEMP; safe to delete) <<<
+                            backup_class_ids=getattr(args, 'backup_class_ids', []))

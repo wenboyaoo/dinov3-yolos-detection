@@ -143,10 +143,6 @@ def get_args_parser():
     parser.add_argument('--backup-top-k', default=5, type=int)
     parser.add_argument('--backup-class-ids', nargs='+', type=int, default=[])
 
-    # >>> DEBUG COST RATIO LOGGING (TEMP; safe to delete) >>>
-    parser.add_argument('--debug-cost-ratio', action='store_true',
-                        help='Print per-class top-k unmatched cost / cost_min ratios each batch (k=1,5,10).')
-    # <<< DEBUG COST RATIO LOGGING (TEMP; safe to delete) <<<
     return parser
 
 
@@ -276,10 +272,7 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm, tb_writer=tb_writer, use_bf16=args.bf16,
-            # >>> DEBUG COST RATIO LOGGING (TEMP; safe to delete) >>>
-            debug_cost_ratio=getattr(args, 'debug_cost_ratio', False))
-            # <<< DEBUG COST RATIO LOGGING (TEMP; safe to delete) <<<
+            args.clip_max_norm, tb_writer=tb_writer, use_bf16=args.bf16)
         lr_scheduler.step(epoch)
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
