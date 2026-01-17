@@ -26,8 +26,12 @@ unfreeze:
   - class_embed
   - bbox_embed
   - det_tokens
-  - det_q_proj
-  - loc_hint
+  - det_coords
+#  - det_q_proj
+#  - det_v_proj
+#  - q_proj
+#  - k_proj
+#  - v_proj
 no_weight_decay:
   - det_tokens
   - det_coords
@@ -40,7 +44,7 @@ set_cost_giou: 2
 ce_loss_coef: 4
 bbox_loss_coef: 5
 giou_loss_coef: 2
-eos_coef: 0.2
+eos_coef: 0.1
 
 # dataset parameters
 dataset_file: voc # options: ["coco","voc"]
@@ -58,8 +62,7 @@ start_epoch: 0
 num_workers: 64
 
 # experiments
-## loc_hint
-use_loc_hint: False
+det_attn_proj_mode: full # ['full', 'separate', 'q', 'v', 'qv']
 ## det_rope
 use_det_rope: False
 ## backup matching

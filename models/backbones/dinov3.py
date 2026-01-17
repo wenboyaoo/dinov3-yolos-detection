@@ -137,8 +137,8 @@ class DINOv3ViTConfig(PretrainedConfig):
         pos_embed_rescale: Optional[float] = None,
         # experiments
         num_det_tokens: int = 100,
-        use_loc_hint: bool = False,
         use_det_rope: bool = False,
+        det_attn_proj_mode: str = "full",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -172,8 +172,8 @@ class DINOv3ViTConfig(PretrainedConfig):
 
         # experiments
         self.num_det_tokens = num_det_tokens
-        self.use_loc_hint = use_loc_hint
         self.use_det_rope = use_det_rope
+        self.det_attn_proj_mode = det_attn_proj_mode
 
 class DINOv3ViTEmbeddings(nn.Module):
     """
@@ -420,11 +420,24 @@ class DINOv3ViTAttention(nn.Module):
         self.dropout = config.attention_dropout
         self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.key_bias)
         self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.value_bias)
+        self.det_v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.value_bias)
 
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.query_bias)
         self.o_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.proj_bias)
 
         self.det_q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.proj_bias)
+
+    def _get_det_attn_proj_mode(self) -> str:
+        mode = getattr(self.config, "det_attn_proj_mode", "full")
+        if mode is None:
+            mode = "full"
+        if isinstance(mode, str):
+            mode = mode.lower()
+        # Backward-compat: older configs may use "none" for the separated/read-only det behavior.
+        allowed = {"full", "separate", "q", "v", "qv"}
+        if mode not in allowed:
+            raise ValueError(f"Invalid det_attn_proj_mode={mode!r}, expected one of {sorted(allowed)}")
+        return mode
 
     def forward(
         self,
@@ -433,24 +446,110 @@ class DINOv3ViTAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         det_rope_cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        det_temperatures: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Input shape: Batch x Time x Channel"""
 
-        batch_size, patches, _ = hidden_states.size()
+        batch_size, seq_len, _ = hidden_states.size()
         _, num_det_tokens, _ = det_tokens.size()
-        len_q = patches + num_det_tokens
+        len_q = seq_len + num_det_tokens
+
+        mode = self._get_det_attn_proj_mode()
+        if mode == "full":
+            # Full self-attention over all tokens with shared Q/K/V projections.
+            # Token order: [prefix (cls+register), det, patches] so that RoPE continues to apply only on patches.
+            num_prefix_tokens = hidden_states.shape[1] - position_embeddings[0].shape[-2]
+            if num_prefix_tokens < 0:
+                raise ValueError(
+                    f"RoPE patch count ({position_embeddings[0].shape[-2]}) exceeds hidden_states length ({hidden_states.shape[1]})."
+                )
+            prefix_states = hidden_states[:, :num_prefix_tokens, :]
+            patch_states = hidden_states[:, num_prefix_tokens:, :]
+            all_tokens = torch.cat((prefix_states, det_tokens, patch_states), dim=1)
+
+            q = self.q_proj(all_tokens)
+            k = self.k_proj(all_tokens)
+            v = self.v_proj(all_tokens)
+
+            q = q.view(batch_size, len_q, self.num_heads, self.head_dim).transpose(1, 2)
+            k = k.view(batch_size, len_q, self.num_heads, self.head_dim).transpose(1, 2)
+            v = v.view(batch_size, len_q, self.num_heads, self.head_dim).transpose(1, 2)
+
+            if det_rope_cos_sin is not None:
+                det_cos, det_sin = det_rope_cos_sin
+                if det_cos.shape[-2] != num_det_tokens or det_sin.shape[-2] != num_det_tokens:
+                    raise ValueError(
+                        "Det RoPE length mismatch: "
+                        f"num_det_tokens={num_det_tokens}, cos seq_len={det_cos.shape[-2]}, sin seq_len={det_sin.shape[-2]}"
+                    )
+                if det_cos.shape[-1] != self.head_dim or det_sin.shape[-1] != self.head_dim:
+                    raise ValueError(
+                        "Det RoPE head_dim mismatch: "
+                        f"head_dim={self.head_dim}, cos last_dim={det_cos.shape[-1]}, sin last_dim={det_sin.shape[-1]}"
+                    )
+
+                if det_cos.dim() == 2:
+                    det_cos = det_cos.unsqueeze(0)
+                    det_sin = det_sin.unsqueeze(0)
+                if det_cos.dim() == 3:
+                    det_cos = det_cos.unsqueeze(1)
+                    det_sin = det_sin.unsqueeze(1)
+
+                det_cos = det_cos.to(device=q.device, dtype=q.dtype)
+                det_sin = det_sin.to(device=q.device, dtype=q.dtype)
+                det_start = num_prefix_tokens
+                det_end = num_prefix_tokens + num_det_tokens
+                q_det = q[..., det_start:det_end, :]
+                q[..., det_start:det_end, :] = (q_det * det_cos) + (rotate_half(q_det) * det_sin)
+
+            cos, sin = position_embeddings
+            q, k = apply_rotary_pos_emb(q=q, k=k, cos=cos, sin=sin)
+
+            attention_interface: Callable = eager_attention_forward
+            if self.config._attn_implementation != "eager":
+                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+            attn_output, attn_weights = attention_interface(
+                self,
+                q,
+                k,
+                v,
+                attention_mask,
+                dropout=0.0,
+                scaling=self.scaling,
+                **kwargs,
+            )
+
+            attn_output = attn_output.reshape(batch_size, len_q, -1).contiguous()
+            attn_output = self.o_proj(attn_output)
+
+            # Recover original ordering: hidden_states = [prefix, patches], det_tokens = [det]
+            out_prefix = attn_output[:, :num_prefix_tokens, :]
+            out_det = attn_output[:, num_prefix_tokens: num_prefix_tokens + num_det_tokens, :]
+            out_patches = attn_output[:, num_prefix_tokens + num_det_tokens :, :]
+            out_hidden = torch.cat((out_prefix, out_patches), dim=1)
+            return out_hidden, out_det, attn_weights
+
+        # Separated modes: det tokens are read-only (K/V come only from hidden_states).
+        separate_det_q = mode in {"q", "qv"}
+        separate_det_v = mode in {"v", "qv"}
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
-        det_query_states = self.det_q_proj(det_tokens)
 
-        query_states = query_states.view(batch_size, patches, self.num_heads, self.head_dim).transpose(1, 2)
+        if separate_det_q:
+            det_query_states = self.det_q_proj(det_tokens)
+        else:
+            det_query_states = self.q_proj(det_tokens)
+
+        det_value_states = self.det_v_proj(hidden_states) if separate_det_v else value_states
+
+        query_states = query_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         det_query_states = det_query_states.view(batch_size, num_det_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(batch_size, patches, self.num_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(batch_size, patches, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        det_value_states = det_value_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         if det_rope_cos_sin is not None:
             det_cos, det_sin = det_rope_cos_sin
@@ -477,15 +576,24 @@ class DINOv3ViTAttention(nn.Module):
             det_sin = det_sin.to(device=det_query_states.device, dtype=det_query_states.dtype)
             det_query_states = (det_query_states * det_cos) + (rotate_half(det_query_states) * det_sin)
 
-        if det_temperatures is not None:
-            if isinstance(det_temperatures, torch.Tensor) and det_temperatures.dim() == 3:
-                det_temperatures = det_temperatures.unsqueeze(1)
-            det_query_states = det_query_states * det_temperatures
-
         query_states = torch.cat((query_states, det_query_states), dim=2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(q=query_states, k=key_states, cos=cos, sin=sin)
+
+        if separate_det_v:
+            # One attention call: use head-doubling trick to get per-query value projection.
+            # Group A heads: real queries for non-det tokens, zero queries for det tokens -> uses base V.
+            # Group B heads: zero queries for non-det tokens, real queries for det tokens -> uses det V.
+            q_non_det = query_states[:, :, :seq_len, :]
+            q_det = query_states[:, :, seq_len:, :]
+
+            q_a = torch.cat((q_non_det, torch.zeros_like(q_det)), dim=2)
+            q_b = torch.cat((torch.zeros_like(q_non_det), q_det), dim=2)
+            query_states = torch.cat((q_a, q_b), dim=1)
+
+            key_states = torch.cat((key_states, key_states), dim=1)
+            value_states = torch.cat((value_states, det_value_states), dim=1)
 
 
         attention_interface: Callable = eager_attention_forward
@@ -504,9 +612,15 @@ class DINOv3ViTAttention(nn.Module):
         )
 
         attn_output = attn_output.reshape(batch_size, len_q, -1).contiguous()
+
+        if separate_det_v:
+            # attn_output: (B, Q, 2*embed_dim) -> split and pick per token type.
+            out_a, out_b = attn_output.split(self.embed_dim, dim=-1)
+            attn_output = torch.cat((out_a[:, :seq_len, :], out_b[:, seq_len:, :]), dim=1)
+
         attn_output = self.o_proj(attn_output)
 
-        return attn_output[:, :patches, :], attn_output[:, patches:, :], attn_weights
+        return attn_output[:, :seq_len, :], attn_output[:, seq_len:, :], attn_weights
 
 
 class DINOv3ViTLayerScale(nn.Module):
@@ -608,7 +722,6 @@ class DINOv3ViTLayer(GradientCheckpointingLayer):
         attention_mask: Optional[torch.Tensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         det_rope_cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        det_temperatures: Optional[torch.Tensor] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Attention with residual connection
         residual = hidden_states
@@ -622,8 +735,7 @@ class DINOv3ViTLayer(GradientCheckpointingLayer):
             det_tokens=det_tokens,
             attention_mask=attention_mask,
             position_embeddings=position_embeddings,
-            det_rope_cos_sin = det_rope_cos_sin,
-            det_temperatures = det_temperatures
+            det_rope_cos_sin = det_rope_cos_sin
         )
 
         hidden_states = self.layer_scale1(hidden_states)
@@ -649,38 +761,6 @@ class DINOv3ViTLayer(GradientCheckpointingLayer):
         det_tokens = self.drop_path(det_tokens) + residual_det
 
         return hidden_states, det_tokens
-
-class GatedMLP(nn.Module):
-    def __init__(self, config, output_size):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.output_size = output_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.output_size, bias=config.mlp_bias)
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
-    
-class LocalizationHint(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config=config
-        self.location_embed = GatedMLP(config, 2)
-        self.temperature_embed = GatedMLP(config, 1)
-    
-    def forward(self, det_tokens):
-        coords = self.location_embed(det_tokens)
-        coords = F.tanh(coords)
-        temperatures = self.temperature_embed(det_tokens)
-        temperatures = F.sigmoid(temperatures)
-        cos_sin = get_rope_from_coords(config=self.config, coords=coords)
-
-        return cos_sin, temperatures
 
 class DINOv3ViTPreTrainedModel(PreTrainedModel):
     config: DINOv3ViTConfig
@@ -748,17 +828,10 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         self.post_init()
 
         self._init_det_q_proj_from_q_proj()
-
-        if config.use_loc_hint:
-            self.loc_hint = LocalizationHint(config)
-        else:
-            self.loc_hint = None
+        self._init_det_v_proj_from_v_proj()
         
         if config.use_det_rope:
-            if config.use_loc_hint:
-                self.det_coords = nn.Parameter(torch.empty(config.num_hidden_layers-1, config.num_det_tokens, 2))
-            else:
-                self.det_coords = nn.Parameter(torch.empty(config.num_hidden_layers, config.num_det_tokens, 2))
+            self.det_coords = nn.Parameter(torch.empty(config.num_hidden_layers, config.num_det_tokens, 2))
             nn.init.uniform_(self.det_coords, -1.0, 1.0)
         else:
             self.det_coords = None
@@ -775,6 +848,19 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
                         module.det_q_proj.bias.copy_(module.q_proj.bias)
                     else:
                         module.det_q_proj.bias.zero_()
+
+    def _init_det_v_proj_from_v_proj(self) -> None:
+        for module in self.modules():
+            if not isinstance(module, DINOv3ViTAttention):
+                continue
+            with torch.no_grad():
+                if module.det_v_proj.weight.shape == module.v_proj.weight.shape:
+                    module.det_v_proj.weight.copy_(module.v_proj.weight)
+                if module.det_v_proj.bias is not None:
+                    if module.v_proj.bias is not None and module.det_v_proj.bias.shape == module.v_proj.bias.shape:
+                        module.det_v_proj.bias.copy_(module.v_proj.bias)
+                    else:
+                        module.det_v_proj.bias.zero_()
 
     def get_input_embeddings(self):
         return self.embeddings.patch_embeddings
@@ -802,18 +888,14 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         for i, layer_module in enumerate(self.layer):
             layer_head_mask = head_mask[i] if head_mask is not None else None
             det_rope_cos_sin = None
-            det_temperatures = None
-            if self.loc_hint is not None and i == len(self.layer)-1:
-                det_rope_cos_sin, det_temperatures = self.loc_hint(det_tokens)
-            elif self.det_coords is not None and i < len(self.det_coords):
+            if self.det_coords is not None and i < len(self.det_coords):
                 det_rope_cos_sin = get_rope_from_coords(config=self.config, coords=self.det_coords[i])
             hidden_states, det_tokens = layer_module(
                 hidden_states = hidden_states,
                 det_tokens = det_tokens,
                 attention_mask=layer_head_mask,
                 position_embeddings=position_embeddings,
-                det_rope_cos_sin = det_rope_cos_sin,
-                det_temperatures = det_temperatures
+                det_rope_cos_sin = det_rope_cos_sin
             )
 
         sequence_output = self.norm(hidden_states)
@@ -853,12 +935,15 @@ class DINOv3Backbone(DINOv3ViTModel):
         handled: set[str] = set()
 
         for name in unloaded:
-            if ".det_q_proj." not in name:
+            if ".det_q_proj." not in name and ".det_v_proj." not in name:
                 continue
             if name not in param_dict:
                 continue
 
-            src_name = name.replace(".det_q_proj.", ".q_proj.")
+            if ".det_q_proj." in name:
+                src_name = name.replace(".det_q_proj.", ".q_proj.")
+            else:
+                src_name = name.replace(".det_v_proj.", ".v_proj.")
             dst_param = param_dict[name]
 
             if src_name in param_dict and param_dict[src_name].shape == dst_param.shape:
@@ -867,7 +952,7 @@ class DINOv3Backbone(DINOv3ViTModel):
                 handled.add(name)
                 continue
 
-            if name.endswith(".det_q_proj.bias"):
+            if name.endswith(".det_q_proj.bias") or name.endswith(".det_v_proj.bias"):
                 with torch.no_grad():
                     dst_param.zero_()
                 handled.add(name)
