@@ -74,6 +74,7 @@ backup_top_k: 10
 ## det postion embedding
 ### additive
 enable_det_additive_embeddings: False
+enable_det_additive_p: False
 ### RoPE
 enable_det_rope: False
 det_rope_type: fixed # ['fixed', 'learnable', 'adaptive']
