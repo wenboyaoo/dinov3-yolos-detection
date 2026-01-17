@@ -150,6 +150,7 @@ class DINOv3ViTConfig(PretrainedConfig):
         max_stride: Optional[int] = 0.2,
         det_tem_power_scale: Optional[float] = 2,
         enable_det_additive_embeddings: bool = False,
+        enable_det_additive_p: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -193,6 +194,7 @@ class DINOv3ViTConfig(PretrainedConfig):
         self.max_stride = max_stride
         self.det_tem_power_scale = det_tem_power_scale
         self.enable_det_additive_embeddings = enable_det_additive_embeddings
+        self.enable_det_additive_p = enable_det_additive_p
 
 class DINOv3ViTEmbeddings(nn.Module):
     """
@@ -642,6 +644,7 @@ class DINOv3ViTAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         patch_position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 		det_rope_embeddings: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+		det_temperature: Optional[torch.Tensor] = None,
 		**kwargs: Any,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Input shape: Batch x Time x Channel"""
@@ -663,12 +666,36 @@ class DINOv3ViTAttention(nn.Module):
         value_states = value_states.view(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
 
         if patch_position_embeddings is not None:
-            query_states, key_states = apply_rotary_pos_emb(q=query_states, k=key_states, cos_sin=patch_position_embeddings, start=patch_s, end=patch_e)
+            query_states, key_states = apply_rotary_pos_emb(
+                q=query_states,
+                k=key_states,
+                cos_sin=patch_position_embeddings,
+                start=patch_s,
+                end=patch_e,
+            )
+
+        det_p: Optional[torch.Tensor] = None
         if det_rope_embeddings is not None:
             cos_sin = det_rope_embeddings[:2]
-            p = det_rope_embeddings[2]
-            query_states, key_states = apply_rotary_pos_emb(q=query_states, k=key_states, cos_sin=cos_sin, start=det_s, end=det_e)
-            query_states, key_states = apply_det_temperature(q=query_states, k=key_states, p=p, p_scale=self.det_tem_power_scale, start=det_s, end=det_e)
+            det_p = det_rope_embeddings[2]
+            query_states, key_states = apply_rotary_pos_emb(
+                q=query_states,
+                k=key_states,
+                cos_sin=cos_sin,
+                start=det_s,
+                end=det_e,
+            )
+        if det_temperature is not None:
+            det_p = det_temperature if det_p is None else (det_p + det_temperature)
+        if det_p is not None:
+            query_states, key_states = apply_det_temperature(
+                q=query_states,
+                k=key_states,
+                p=det_p,
+                p_scale=self.det_tem_power_scale,
+                start=det_s,
+                end=det_e,
+            )
 
         attention_interface: Callable = eager_attention_forward
 
@@ -790,6 +817,7 @@ class DINOv3ViTLayer(GradientCheckpointingLayer):
         attention_mask: Optional[torch.Tensor] = None,
         patch_position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         det_rope_embeddings: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        det_temperature: Optional[torch.Tensor] = None,
         output_marginal_attention: bool = False,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         # Attention with residual connection
@@ -803,7 +831,8 @@ class DINOv3ViTLayer(GradientCheckpointingLayer):
                 attention_gate=attention_gate,
                 attention_mask=attention_mask,
                 patch_position_embeddings=patch_position_embeddings,
-                det_rope_embeddings=det_rope_embeddings
+                det_rope_embeddings=det_rope_embeddings,
+                det_temperature=det_temperature,
             )
             marginal_attn = get_marginal_attn(attention_weights=attention_weights, det_s=det_s, det_e=det_e, patch_s=patch_s, patch_e=patch_e, num_patches_h=num_patches_h, num_patches_w=num_patches_w)
         else:
@@ -813,7 +842,8 @@ class DINOv3ViTLayer(GradientCheckpointingLayer):
                 attention_gate=attention_gate,
                 attention_mask=attention_mask,
                 patch_position_embeddings=patch_position_embeddings,
-                det_rope_embeddings=det_rope_embeddings
+                det_rope_embeddings=det_rope_embeddings,
+                det_temperature=det_temperature,
             )
 
         hidden_states = self.layer_scale1(hidden_states)
@@ -915,6 +945,7 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         self.det_token_gate = config.det_token_gate
         self.enable_det_rope = config.enable_det_rope
         self.enable_det_additive_embeddings = config.enable_det_additive_embeddings
+        self.enable_det_additive_p = config.enable_det_additive_p
 
         self.gradient_checkpointing = False
         self.post_init()
@@ -932,14 +963,10 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
             elif self.det_rope_type == 'learnable':
                 self.det_rope_params = nn.Parameter(torch.empty(self.config.num_hidden_layers, self.config.num_det_tokens, 3))
                 torch.nn.init.uniform_(self.det_rope_params, a=-1, b=1)
-                with torch.no_grad():
-                    self.det_rope_params[..., 2:].zero_()
             elif self.det_rope_type == 'adaptive':
                 self.det_rope_params = nn.Parameter(torch.empty(self.config.num_det_tokens, 3))
                 self.det_rope_updater = nn.ModuleList([DetRopeUpdater(config) for _ in range(config.num_hidden_layers)])
                 torch.nn.init.uniform_(self.det_rope_params, a=-1, b=1)
-                with torch.no_grad():
-                    self.det_rope_params[..., 2:].zero_()
             else:
                 raise ValueError(f'unknown det RoPE type {self.det_rope_type}')
         
@@ -950,6 +977,10 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
                 mean=0.0,
                 std=self.config.initializer_range,
             )
+        if self.enable_det_additive_p:
+            # Learnable per-layer, per-det-token temperature (p). Initialized to 0 => exp(p)=1 (no behavior change).
+            self.det_additive_p = nn.Parameter(torch.empty(self.config.num_hidden_layers, self.config.num_det_tokens))
+            torch.nn.init.uniform_(self.det_additive_p, a=-1, b=1)
 
     def get_input_embeddings(self):
         return self.embeddings.patch_embeddings
@@ -1015,10 +1046,16 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         for i, layer_module in enumerate(self.layer):
             layer_head_mask = head_mask[i] if head_mask is not None else None
 
+            det_temperature = None
+
             if self.enable_det_additive_embeddings:
                 det_e = hidden_states.shape[1]
                 det_s = det_e - self.config.num_det_tokens
                 hidden_states[:,det_s:det_e,:] += self.det_additive_embeddings[i]
+
+            if self.enable_det_additive_p:
+                # (N,) -> (B, N)
+                det_temperature = self.det_additive_p[i].view(1, -1).expand(batch_size, -1)
             if self.enable_det_rope:
                 if self.det_rope_type == "adaptive":
                     layer_det_rope_param = rope_params
@@ -1041,6 +1078,7 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
                         attention_mask=layer_head_mask,
                         patch_position_embeddings=patch_position_embeddings,
                         det_rope_embeddings=det_rope_embeddings,
+                        det_temperature=det_temperature,
                         output_marginal_attention=True,
                     )
                     marginal_attn = (marginal_attn[0].detach(), marginal_attn[1].detach())
@@ -1062,6 +1100,7 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
                         attention_mask=layer_head_mask,
                         patch_position_embeddings=patch_position_embeddings,
                         det_rope_embeddings=det_rope_embeddings,
+                        det_temperature=det_temperature,
                         output_marginal_attention=False,
                     )
             else:
@@ -1071,6 +1110,7 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
                     attention_gate=attention_gate,
                     attention_mask=layer_head_mask,
                     patch_position_embeddings=patch_position_embeddings,
+                    det_temperature=det_temperature,
                     output_marginal_attention=False,
                 )
 
@@ -1124,7 +1164,10 @@ class DINOv3Backbone(DINOv3ViTModel):
                 if "det_rope_params" in name.split(".") and param.data.dim() >= 2 and param.data.shape[-1] == 3:
                     with torch.no_grad():
                         param.data[..., :2].uniform_(-1, 1)
-                        param.data[..., 2:].zero_()
+                        param.data[..., 2:].uniform_(-1, 1)
+                elif "det_additive_p" in name.split(".") and param.data.dim() >= 1:
+                    with torch.no_grad():
+                        param.data.uniform_(-1, 1)
                 else:
                     torch.nn.init.trunc_normal_(param.data, std=self.config.initializer_range)
 
