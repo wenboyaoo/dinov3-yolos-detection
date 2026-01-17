@@ -29,16 +29,12 @@ def get_args_parser():
     parser = argparse.ArgumentParser('Set YOLOS', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--backbone-lr', default=1e-5, type=float)
-    parser.add_argument('--layer-decay', default=1, type=float)
     parser.add_argument('--batch-size', default=2, type=int)
     parser.add_argument('--weight-decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=150, type=int)
     parser.add_argument('--clip-max-norm', default=0.1, type=float,
                         help='gradient clipping max norm')
-    parser.add_argument('--use-checkpoint', action='store_true',
-                        help='use checkpoint.checkpoint to save mem')
     parser.add_argument('--evaluator', default='coco', type=str)
-    parser.add_argument('--eval-size', default=800, type=int)
     parser.add_argument('--eval-during-training', action='store_true')
     parser.add_argument('--eval-epochs', default=1, type=int)
     # scheduler
@@ -69,33 +65,17 @@ def get_args_parser():
                         help="Number of det token in the deit backbone")
     parser.add_argument('--backbone', default='dinov3', type=str,
                         help="Name of the backbone to use"),
-    parser.add_argument('--backbone-size', default='dinov3', type=str,
-                        help="Size of the backbone to use"),
+    parser.add_argument('--backbone-size', default='small', type=str,
+                        help="Backbone size tag (used by some dataset transforms)")
     parser.add_argument('--unfreeze', nargs='+', default=[]),
     parser.add_argument('--no-weight-decay', nargs='+', default=[]),
     # backbone weights
     parser.add_argument('--pretrained', default=None, type=str,
                         help='Pretrained checkpoint path or HF model id')
-    parser.add_argument('--init-pe-size', nargs='+', type=int,
-                        help="init pe size (h,w)")
-    parser.add_argument('--mid-pe-size', nargs='+', type=int,
-                        help="mid pe size (h,w)")
 
-    # * Experiments (det tokens / det RoPE)
-    parser.add_argument('--det-token-gate', default=None, type=str,
-                        help="Det token attention gate: block_non_det_read_det | block_all_read_det")
-    parser.add_argument('--enable-det-rope', action='store_true',
-                        help='Enable det token RoPE')
-    parser.add_argument('--det-rope-type', default='fixed', type=str,
-                        help='Det RoPE type: fixed | learnable | adaptive')
-    parser.add_argument('--token-proj-dim', default=32, type=int)
-    parser.add_argument('--attn-interp-dim', default=50, type=int)
-    parser.add_argument('--attn-proj-dim', default=32, type=int)
-    parser.add_argument('--det-mlp-intermediate-size', default=64, type=int)
-    parser.add_argument('--max-stride', default=0.2, type=float)
-    parser.add_argument('--det-tem-power-scale', default=2.0, type=float)
-    parser.add_argument('--enable-det-additive-embeddings', action='store_true',
-                        help='Enable per-layer additive embeddings for det tokens')
+    # * Experiments
+    parser.add_argument('--use-loc-hint', action='store_true',
+                        help='Enable localization hint for det tokens (dinov3 only)')
     # * Matcher
     parser.add_argument('--set-cost-class', default=1, type=float,
                         help="Class coefficient in the matching cost")
@@ -108,10 +88,6 @@ def get_args_parser():
     parser.add_argument('--ce-loss-coef', default=1, type=float)
     parser.add_argument('--bbox-loss-coef', default=5, type=float)
     parser.add_argument('--giou-loss-coef', default=2, type=float)
-    parser.add_argument('--aux-loss-coef', default=1.0, type=float,
-                        help='Overall coefficient for auxiliary det losses (applied to CE/BBox/GIoU)')
-    parser.add_argument('--rope-center-loss-coef', default=0.1, type=float,
-                        help='Coefficient for matched rope (y,x) center alignment loss')
     parser.add_argument('--eos-coef', default=0.1, type=float,
                         help="Relative classification weight of the no-object class")
 

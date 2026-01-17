@@ -2,7 +2,7 @@ lr: 8.0e-4
 backbone_lr: 8.0e-5
 batch_size: 16
 weight_decay: 5.0e-4
-epochs: 100
+epochs: 75
 clip_max_norm: 0.1
 bf16: True
 eval_during_training: True
@@ -21,22 +21,16 @@ decay_rate: 0.1
 num_det_tokens: 64
 backbone: dinov3 # options: ["vanilla_vit", "dinov3"]
 pretrained: facebook/dinov3-vits16-pretrain-lvd1689m
+backbone_size: small
 unfreeze: 
   - class_embed
   - bbox_embed
-  - backbone.embeddings.det_tokens
-  - backbone.det_additive_embeddings
-  - backbone.det_rope_params
-  - backbone.det_rope_updater
+  - det_tokens
+  - det_q_proj
+  - loc_hint
 no_weight_decay:
   - det_tokens
-  - det_additive_embeddings
-  - det_rope_params
-## vanilla_vit
-backbone_size: small
-use_checkpoint: False
-init_pe_size: [512,864]
-mid_pe_size: [512,864]
+  - det_coords
 
 # Matcher
 set_cost_class: 4
@@ -55,7 +49,7 @@ coco_path: data/VOC2012_train_val
 remove_difficult: False
 output_dir: outputs/sample
 device: cuda
-resize: 512
+resize: 640
 
 seed: 42
 resume: # resume from checkpoint
@@ -64,26 +58,12 @@ start_epoch: 0
 num_workers: 64
 
 # experiments
-## attention gates
-det_token_gate: # ['block_non_det_read_det', 'block_all_read_det']
+## loc_hint
+use_loc_hint: False
+## det_rope
+use_det_rope: False
 ## backup matching
 backup_matching: False
 backup_class_ids: []
 backup_k_scale: 4
 backup_top_k: 10
-## det postion embedding
-### additive
-enable_det_additive_embeddings: False
-enable_det_additive_p: False
-### RoPE
-enable_det_rope: False
-det_rope_type: fixed # ['fixed', 'learnable', 'adaptive']
-#### adaptive RoPE
-token_proj_dim: 64
-attn_interp_dim: 64
-attn_proj_dim: 64
-det_mlp_intermediate_size: 128
-max_stride: 0.05
-det_tem_power_scale: 2.0
-aux_loss_coef: 0.2
-rope_center_loss_coef: 0.25

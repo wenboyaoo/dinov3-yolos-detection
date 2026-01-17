@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import math
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -25,9 +25,6 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.pytorch_utils import compile_compatible_method_lru_cache
-from transformers.utils import logging, is_torch_npu_available, is_torch_xpu_available
-from transformers.utils.import_utils import is_torch_greater_or_equal
-from transformers.utils.generic import check_model_inputs
 from transformers.configuration_utils import PretrainedConfig
 
 class DINOv3ViTConfig(PretrainedConfig):
@@ -140,17 +137,8 @@ class DINOv3ViTConfig(PretrainedConfig):
         pos_embed_rescale: Optional[float] = None,
         # experiments
         num_det_tokens: int = 100,
-        det_token_gate: Optional[str] = None,
-        enable_det_rope: bool = False,
-        det_rope_type: Optional[str] = 'fixed',
-        token_proj_dim: Optional[int] = 32,
-        attn_interp_dim: Optional[int] = 50,
-        attn_proj_dim: Optional[int] = 32,
-        det_mlp_intermediate_size: Optional[int] = 64,
-        max_stride: Optional[int] = 0.2,
-        det_tem_power_scale: Optional[float] = 2,
-        enable_det_additive_embeddings: bool = False,
-        enable_det_additive_p: bool = False,
+        use_loc_hint: bool = False,
+        use_det_rope: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -184,17 +172,8 @@ class DINOv3ViTConfig(PretrainedConfig):
 
         # experiments
         self.num_det_tokens = num_det_tokens
-        self.det_token_gate = det_token_gate
-        self.enable_det_rope = enable_det_rope
-        self.det_rope_type = det_rope_type
-        self.attn_interp_dim = attn_interp_dim
-        self.token_proj_dim = token_proj_dim
-        self.attn_proj_dim = attn_proj_dim
-        self.det_mlp_intermediate_size = det_mlp_intermediate_size
-        self.max_stride = max_stride
-        self.det_tem_power_scale = det_tem_power_scale
-        self.enable_det_additive_embeddings = enable_det_additive_embeddings
-        self.enable_det_additive_p = enable_det_additive_p
+        self.use_loc_hint = use_loc_hint
+        self.use_det_rope = use_det_rope
 
 class DINOv3ViTEmbeddings(nn.Module):
     """
@@ -212,7 +191,7 @@ class DINOv3ViTEmbeddings(nn.Module):
         )
         self.det_tokens = nn.Parameter(torch.empty(1, config.num_det_tokens, config.hidden_size))
 
-    def forward(self, pixel_values: torch.Tensor, bool_masked_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, pixel_values: torch.Tensor, bool_masked_pos: Optional[torch.Tensor] = None) -> tuple[torch.Tensor,torch.Tensor]:
         batch_size = pixel_values.shape[0]
         target_dtype = self.patch_embeddings.weight.dtype
 
@@ -226,9 +205,9 @@ class DINOv3ViTEmbeddings(nn.Module):
         cls_token = self.cls_token.expand(batch_size, -1, -1)
         register_tokens = self.register_tokens.expand(batch_size, -1, -1)
         det_tokens = self.det_tokens.expand(batch_size, -1, -1)
-        embeddings = torch.cat((cls_token, register_tokens, patch_embeddings, det_tokens), dim=1)
+        embeddings = torch.cat((cls_token, register_tokens, patch_embeddings), dim=1)
 
-        return embeddings
+        return embeddings, det_tokens
 
 
 @compile_compatible_method_lru_cache(maxsize=32)
@@ -258,47 +237,6 @@ def get_patches_center_coordinates(
     coords = 2.0 * coords - 1.0
     return coords
 
-def get_fixed_det_coordinates(
-    num_h: int, num_w: int
-) -> torch.Tensor:
-    coords_h = torch.arange(0.5, num_h)
-    coords_w = torch.arange(0.5, num_w)
-    coords_h = coords_h / num_h
-    coords_w = coords_w / num_w
-    coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"), dim=-1)
-    coords = coords.flatten(0, 1)
-    coords = 2.0 * coords - 1.0
-    return coords
-
-
-def augment_patches_center_coordinates(
-    coords: torch.Tensor,
-    shift: Optional[float] = None,
-    jitter: Optional[float] = None,
-    rescale: Optional[float] = None,
-) -> torch.Tensor:
-    # Shift coords by adding a uniform value in [-shift, shift]
-    if shift is not None:
-        shift_hw = torch.empty((1, 2), device=coords.device, dtype=coords.dtype)
-        shift_hw = shift_hw.uniform_(-shift, shift)
-        coords = coords + shift_hw
-
-    # Jitter coords by multiplying the range [-1, 1] by a log-uniform value in [1/jitter, jitter]
-    if jitter is not None:
-        jitter_range = np.log(jitter)
-        jitter_hw = torch.empty((1, 2), device=coords.device, dtype=coords.dtype)
-        jitter_hw = jitter_hw.uniform_(-jitter_range, jitter_range).exp()
-        coords = coords * jitter_hw
-
-    # Rescale coords by multiplying the range [-1, 1] by a log-uniform value in [1/rescale, rescale]
-    if rescale is not None:
-        rescale_range = np.log(rescale)
-        rescale_hw = torch.empty(1, device=coords.device, dtype=coords.dtype)
-        rescale_hw = rescale_hw.uniform_(-rescale_range, rescale_range).exp()
-        coords = coords * rescale_hw
-
-    return coords
-
 
 class DINOv3ViTRopePositionEmbedding(nn.Module):
     inv_freq: torch.Tensor
@@ -315,13 +253,12 @@ class DINOv3ViTRopePositionEmbedding(nn.Module):
         inv_freq = 1 / self.base ** torch.arange(0, 1, 4 / self.head_dim, dtype=torch.float32)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, info) -> tuple[torch.Tensor, torch.Tensor]:
-        num_patches_h, num_patches_w, device, dtype = (
-            info["num_patches_h"],
-            info["num_patches_w"],
-            info["device"],
-            info["dtype"],
-        )
+    def forward(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        _, _, height, width = pixel_values.shape
+        num_patches_h = height // self.config.patch_size
+        num_patches_w = width // self.config.patch_size
+
+        device = pixel_values.device
         device_type = device.type if isinstance(device.type, str) and device.type != "mps" else "cpu"
 
         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
@@ -339,157 +276,40 @@ class DINOv3ViTRopePositionEmbedding(nn.Module):
             cos = torch.cos(angles)
             sin = torch.sin(angles)
 
-        cos = cos.unsqueeze(0).unsqueeze(0)
-        sin = sin.unsqueeze(0).unsqueeze(0)
-
+        dtype = pixel_values.dtype
         return cos.to(dtype=dtype), sin.to(dtype=dtype)
 
+def get_rope_from_coords(config, coords:torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    device = coords.device
+    dtype = coords.dtype
 
-class DetRopePositionEmbedding(nn.Module):
-    inv_freq: torch.Tensor
+    if coords.shape[-1] != 2:
+        raise ValueError(f"coords must have shape (..., 2), got {tuple(coords.shape)}")
 
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.base = config.rope_theta
-        self.head_dim = config.hidden_size // config.num_attention_heads
-        inv_freq = 1 / self.base ** torch.arange(0, 1, 4 / self.head_dim, dtype=torch.float32)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-    
-    def forward(self, coords: torch.Tensor, info: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        device, dtype = info['device'], info['dtype']
-        device_type = device.type if isinstance(device.type, str) and device.type != "mps" else "cpu"
+    base = config.rope_theta
+    head_dim = config.hidden_size // config.num_attention_heads
+    inv_freq = 1 / base ** torch.arange(0, 1, 4 / head_dim, dtype=torch.float32)
 
-        # Accept coords as (N, 2) or (B, N, 2)
-        if coords.dim() == 2:
-            coords = coords.unsqueeze(0)
-        if coords.dim() != 3 or coords.shape[-1] != 2:
-            raise ValueError(f"coords must be (N,2) or (B,N,2), got {tuple(coords.shape)}")
+    device_type = device.type if isinstance(device.type, str) and device.type != "mps" else "cpu"
 
-        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            # Although we could precompute static patch_coords from image_size and patch_size in the config,
-            # the model was trained with random_scale, so it can process images of varying sizes.
-            # Therefore, it's better to compute patch_coords dynamically (with lru_cache).
+    with torch.autocast(device_type=device_type, enabled=False):  # Force float32
+        coords_f32 = coords.to(device=device, dtype=torch.float32)
+        inv_freq_f32 = inv_freq.to(device=device, dtype=torch.float32)
 
-            # coords: (B, N, 2) -> (B, N, 2, 1) to broadcast against inv_freq: (1, 1, 1, F)
-            angles = 2 * math.pi * coords[:, :, :, None] * self.inv_freq[None, None, None, :]
-            # (B, N, 2, F) -> (B, N, 2*F)
-            angles = angles.flatten(2, 3)
-            angles = angles.tile(2)
+        # coords_f32: (..., 2)
+        # inv_freq_f32: (head_dim/4,)
+        # angles: (..., 2, head_dim/4) -> (..., head_dim/2) -> (..., head_dim)
+        angles = 2 * math.pi * coords_f32[..., :, None] * inv_freq_f32
+        angles = angles.reshape(*coords_f32.shape[:-1], -1)
+        angles = torch.cat((angles, angles), dim=-1)
 
-            cos = torch.cos(angles)
-            sin = torch.sin(angles)
+        cos = torch.cos(angles)
+        sin = torch.sin(angles)
 
-        # (B, N, head_dim) -> (B, 1, N, head_dim)
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-
-        return cos.to(dtype=dtype), sin.to(dtype=dtype)
-
-
-class DetRopeUpdater(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.token_proj_dim = config.token_proj_dim
-        self.attn_interp_dim = config.attn_interp_dim
-        self.attn_proj_dim = config.attn_proj_dim
-        self.intermediate_size = config.det_mlp_intermediate_size
-        self.max_stride = config.max_stride
-        self.feature_dim = 1 + self.attn_proj_dim + self.token_proj_dim + 1 + 1
-
-        self.token_proj = nn.Linear(self.hidden_size, self.token_proj_dim)
-        self.attn_proj = nn.Linear(self.attn_interp_dim, self.attn_proj_dim)
-        self.gate_proj = nn.Linear(self.feature_dim, self.intermediate_size)
-        self.up_proj = nn.Linear(self.feature_dim, self.intermediate_size)
-        self.down_proj = nn.Linear(self.intermediate_size, 2)
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, marginal_attn: tuple[torch.Tensor, torch.Tensor], det_tokens: torch.Tensor, rope_params: torch.Tensor) -> torch.Tensor:
-        attn_h, attn_w = marginal_attn
-        batch_size, num_det = attn_h.shape[0], attn_h.shape[1]
-        if det_tokens.shape[0] != batch_size or det_tokens.shape[1] != num_det:
-            raise ValueError(
-                f"Shape mismatch: attn_h is [B={batch_size},N={num_det},H], det_tokens is {tuple(det_tokens.shape)}"
-            )
-        if rope_params.shape[0] != batch_size or rope_params.shape[1] != num_det:
-            raise ValueError(
-                f"Shape mismatch: attn_h is [B={batch_size},N={num_det},H], rope_params is {tuple(rope_params.shape)}"
-            )
-
-        device = det_tokens.device
-        dtype = det_tokens.dtype
-        attn_h = attn_h.to(device=device, dtype=dtype)
-        attn_w = attn_w.to(device=device, dtype=dtype)
-        rope_params = rope_params.to(device=device, dtype=dtype)
-
-        y = rope_params[..., 0:1]
-        x = rope_params[..., 1:2]
-        p = rope_params[..., 2:3]
-
-        def _interp_1d(attn_1d: torch.Tensor) -> torch.Tensor:
-            if attn_1d.shape[-1] == self.attn_interp_dim:
-                return attn_1d
-            x_in = attn_1d.reshape(batch_size * num_det, 1, attn_1d.shape[-1])
-            x_out = F.interpolate(x_in, size=self.attn_interp_dim, mode="linear", align_corners=False)
-            return x_out.reshape(batch_size, num_det, self.attn_interp_dim)
-
-        attn_h_proj = self.attn_proj(_interp_1d(attn_h))
-        attn_w_proj = self.attn_proj(_interp_1d(attn_w))
-        token_proj = self.token_proj(det_tokens)
-
-        dir_h = torch.zeros((batch_size, num_det, 1), device=device, dtype=dtype)
-        dir_w = torch.ones((batch_size, num_det, 1), device=device, dtype=dtype)
-
-        feature_h = torch.cat((dir_h, attn_h_proj, token_proj, y, p), dim=-1)
-        feature_w = torch.cat((dir_w, attn_w_proj, token_proj, x, p), dim=-1)
-
-        delta_h = self.down_proj(self.act_fn(self.gate_proj(feature_h)) * self.up_proj(feature_h))
-        delta_w = self.down_proj(self.act_fn(self.gate_proj(feature_w)) * self.up_proj(feature_w))
-
-        d_y = self.max_stride * torch.tanh(delta_h[..., 0:1])
-        d_p_h = torch.tanh(delta_h[..., 1:2])
-        d_x = self.max_stride * torch.tanh(delta_w[..., 0:1])
-        d_p_w = torch.tanh(delta_w[..., 1:2])
-
-        d_p = (d_p_h + d_p_w) / 2
-
-        y_next = torch.clamp(y + d_y, -1, 1)
-        x_next = torch.clamp(x + d_x, -1, 1)
-        p_next = d_p
-
-        rope_params_next = torch.cat((y_next, x_next, p_next), dim=-1)
-        return rope_params_next
-    
-def get_marginal_attn(
-        det_s: int, det_e: int,
-        patch_s:int, patch_e:int, 
-    num_patches_h:int, num_patches_w:int,
-    attn_weights: Optional[torch.Tensor] = None,
-    attention_weights: Optional[torch.Tensor] = None,
-    **kwargs,
-)-> tuple[torch.Tensor, torch.Tensor]:
-
-    # Backward/forward compatible kwarg naming
-    if attn_weights is None:
-        attn_weights = attention_weights
-    if attn_weights is None:
-        raise TypeError("get_marginal_attn() missing required argument: 'attn_weights'")
-
-    attn = attn_weights[:, :, det_s:det_e, patch_s:patch_e]
-    attn = attn.mean(dim=1)
-
-    attn = attn.reshape(attn.shape[0], attn.shape[1], num_patches_h, num_patches_w)
-
-    attn_h = attn.sum(dim=-1)
-    attn_w = attn.sum(dim=-2)
-
-    return attn_h, attn_w
+    return cos.to(dtype=dtype), sin.to(dtype=dtype)
     
 def apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor, cos_sin: list[torch.Tensor], 
-    start: int, end: int, **kwargs
+    q: torch.Tensor, k: torch.Tensor, cos:torch.Tensor, sin: torch.Tensor, **kwargs
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Applies Rotary Position Embedding to the query and key tensors, but only to the patch tokens,
     ignoring the prefix tokens (cls token and register tokens).
@@ -503,11 +323,19 @@ def apply_rotary_pos_emb(
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    k_len = k.shape[-2]
+    num_patches = sin.shape[-2]
+    num_prefix_tokens = k_len - num_patches
+    if num_prefix_tokens < 0:
+        raise ValueError(
+            f"RoPE patch count ({num_patches}) exceeds key length ({k_len}). "
+        )
+    start = num_prefix_tokens
+    end = k_len
 
     q_tokens = q[..., start:end, :]
     k_tokens = k[..., start:end, :]
 
-    cos, sin = cos_sin
     cos = cos.to(device=q_tokens.device, dtype=q_tokens.dtype)
     sin = sin.to(device=q_tokens.device, dtype=q_tokens.dtype)
 
@@ -521,38 +349,20 @@ def apply_rotary_pos_emb(
 
     return q_out, k_out
 
-def apply_det_temperature(
-    q: torch.Tensor, k: torch.Tensor, p: torch.Tensor, p_scale: float,
-    start: int, end: int, **kwargs
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # IMPORTANT: do NOT scale slices in-place on `q`/`k` views (AsStrided).
-    q_tokens = q[..., start:end, :]
-    k_tokens = k[..., start:end, :]
 
-    p = p * p_scale
-    tem = torch.exp(p)
+def apply_rotary_pos_emb_q(
+    q: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, **kwargs
+) -> torch.Tensor:
+    if q.shape[-2] != cos.shape[-2] or q.shape[-2] != sin.shape[-2]:
+        raise ValueError(
+            "RoPE length mismatch: "
+            f"q seq_len={q.shape[-2]}, cos seq_len={cos.shape[-2]}, sin seq_len={sin.shape[-2]}"
+        )
 
-    # Normalize shapes for broadcasting to (B, heads, N, head_dim/2)
-    def _norm_tem(t: torch.Tensor) -> torch.Tensor:
-        if t.dim() == 1:  # (N,)
-            return t.view(1, 1, -1, 1)
-        if t.dim() == 2:  # (B, N)
-            return t.unsqueeze(1).unsqueeze(-1)
-        if t.dim() == 3:  # (B, N, 1)
-            return t.unsqueeze(1)
-        return t
+    cos = cos.to(device=q.device, dtype=q.dtype)
+    sin = sin.to(device=q.device, dtype=q.dtype)
 
-    tem = _norm_tem(tem).to(device=q_tokens.device, dtype=q_tokens.dtype)
-
-    q_scaled = q_tokens * tem
-    k_scaled = k_tokens * tem
-
-    q_out = q.clone()
-    k_out = k.clone()
-    q_out[..., start:end, :] = q_scaled
-    k_out[..., start:end, :] = k_scaled
-
-    return q_out, k_out
+    return (q * cos) + (rotate_half(q) * sin)
 
 
 def rotate_half(x):
@@ -561,29 +371,11 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-def _to_additive_gate(
-    gate: torch.Tensor,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    gate = gate.to(device=device)
-
-    if gate.dtype == torch.bool:
-        neg_inf = torch.finfo(dtype).min
-        return torch.where(
-            gate,
-            torch.zeros((), device=device, dtype=dtype),
-            torch.full((), neg_inf, device=device, dtype=dtype),
-        )
-    else:
-        return gate.to(dtype=dtype, device=device)
-
 def eager_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attention_gate: Optional[torch.Tensor],
     attention_mask: Optional[torch.Tensor],
     scaling: float,
     dropout: float = 0.0,
@@ -591,9 +383,7 @@ def eager_attention_forward(
 ):
     # Take the dot product between "query" and "key" to get the raw attention scores.
     attn_weights = torch.matmul(query, key.transpose(-1, -2)) * scaling
-    if attention_gate is not None:
-        additive_gate = _to_additive_gate(gate=attention_gate, dtype=attn_weights.dtype, device=attn_weights.device)
-        attn_weights = attn_weights + additive_gate
+
     # Normalize the attention scores to probabilities.
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
 
@@ -634,87 +424,89 @@ class DINOv3ViTAttention(nn.Module):
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.query_bias)
         self.o_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.proj_bias)
 
-        self.det_tem_power_scale = config.det_tem_power_scale
+        self.det_q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.proj_bias)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        batch_info: dict,
-        attention_gate: Optional[torch.Tensor] = None,
+        det_tokens: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        patch_position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-		det_rope_embeddings: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
-		det_temperature: Optional[torch.Tensor] = None,
-		**kwargs: Any,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        det_rope_cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        det_temperatures: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Input shape: Batch x Time x Channel"""
 
-        batch_size, num_tokens = hidden_states.shape[0], hidden_states.shape[1]
-        patch_s, patch_e, det_s, det_e = (
-            batch_info["patch_s"],
-            batch_info["patch_e"],
-            batch_info["det_s"],
-            batch_info["det_e"],
-        )
+        batch_size, patches, _ = hidden_states.size()
+        _, num_det_tokens, _ = det_tokens.size()
+        len_q = patches + num_det_tokens
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
+        det_query_states = self.det_q_proj(det_tokens)
 
-        query_states = query_states.view(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(batch_size, patches, self.num_heads, self.head_dim).transpose(1, 2)
+        det_query_states = det_query_states.view(batch_size, num_det_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(batch_size, patches, self.num_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, patches, self.num_heads, self.head_dim).transpose(1, 2)
 
-        if patch_position_embeddings is not None:
-            query_states, key_states = apply_rotary_pos_emb(
-                q=query_states,
-                k=key_states,
-                cos_sin=patch_position_embeddings,
-                start=patch_s,
-                end=patch_e,
-            )
+        if det_rope_cos_sin is not None:
+            det_cos, det_sin = det_rope_cos_sin
 
-        det_p: Optional[torch.Tensor] = None
-        if det_rope_embeddings is not None:
-            cos_sin = det_rope_embeddings[:2]
-            det_p = det_rope_embeddings[2]
-            query_states, key_states = apply_rotary_pos_emb(
-                q=query_states,
-                k=key_states,
-                cos_sin=cos_sin,
-                start=det_s,
-                end=det_e,
-            )
-        if det_temperature is not None:
-            det_p = det_temperature if det_p is None else (det_p + det_temperature)
-        if det_p is not None:
-            query_states, key_states = apply_det_temperature(
-                q=query_states,
-                k=key_states,
-                p=det_p,
-                p_scale=self.det_tem_power_scale,
-                start=det_s,
-                end=det_e,
-            )
+            if det_cos.shape[-2] != num_det_tokens or det_sin.shape[-2] != num_det_tokens:
+                raise ValueError(
+                    "Det RoPE length mismatch: "
+                    f"num_det_tokens={num_det_tokens}, cos seq_len={det_cos.shape[-2]}, sin seq_len={det_sin.shape[-2]}"
+                )
+            if det_cos.shape[-1] != self.head_dim or det_sin.shape[-1] != self.head_dim:
+                raise ValueError(
+                    "Det RoPE head_dim mismatch: "
+                    f"head_dim={self.head_dim}, cos last_dim={det_cos.shape[-1]}, sin last_dim={det_sin.shape[-1]}"
+                )
+
+            if det_cos.dim() == 2:
+                det_cos = det_cos.unsqueeze(0)
+                det_sin = det_sin.unsqueeze(0)
+            if det_cos.dim() == 3:
+                det_cos = det_cos.unsqueeze(1)
+                det_sin = det_sin.unsqueeze(1)
+
+            det_cos = det_cos.to(device=det_query_states.device, dtype=det_query_states.dtype)
+            det_sin = det_sin.to(device=det_query_states.device, dtype=det_query_states.dtype)
+            det_query_states = (det_query_states * det_cos) + (rotate_half(det_query_states) * det_sin)
+
+        if det_temperatures is not None:
+            if isinstance(det_temperatures, torch.Tensor) and det_temperatures.dim() == 3:
+                det_temperatures = det_temperatures.unsqueeze(1)
+            det_query_states = det_query_states * det_temperatures
+
+        query_states = torch.cat((query_states, det_query_states), dim=2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(q=query_states, k=key_states, cos=cos, sin=sin)
+
 
         attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
-            module=self,
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            attention_gate=attention_gate,
-            attention_mask=attention_mask,
-            dropout=0.0 if not self.training else self.dropout,
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0,
             scaling=self.scaling,
             **kwargs,
         )
 
-        attn_output = attn_output.reshape(batch_size, num_tokens, -1).contiguous()
+        attn_output = attn_output.reshape(batch_size, len_q, -1).contiguous()
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, attn_weights
+        return attn_output[:, :patches, :], attn_output[:, patches:, :], attn_weights
 
 
 class DINOv3ViTLayerScale(nn.Module):
@@ -812,55 +604,83 @@ class DINOv3ViTLayer(GradientCheckpointingLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        batch_info: dict,
-        attention_gate: Optional[torch.Tensor] = None,
+        det_tokens: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        patch_position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        det_rope_embeddings: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
-        det_temperature: Optional[torch.Tensor] = None,
-        output_marginal_attention: bool = False,
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        det_rope_cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        det_temperatures: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Attention with residual connection
         residual = hidden_states
+        residual_det = det_tokens
+
         hidden_states = self.norm1(hidden_states)
-        if output_marginal_attention:
-            det_s, det_e, patch_s, patch_e, num_patches_h, num_patches_w = batch_info['det_s'], batch_info['det_e'], batch_info['patch_s'], batch_info['patch_e'], batch_info['num_patches_h'], batch_info['num_patches_w']
-            hidden_states, attention_weights = self.attention(
-                hidden_states=hidden_states,
-                batch_info=batch_info,
-                attention_gate=attention_gate,
-                attention_mask=attention_mask,
-                patch_position_embeddings=patch_position_embeddings,
-                det_rope_embeddings=det_rope_embeddings,
-                det_temperature=det_temperature,
-            )
-            marginal_attn = get_marginal_attn(attention_weights=attention_weights, det_s=det_s, det_e=det_e, patch_s=patch_s, patch_e=patch_e, num_patches_h=num_patches_h, num_patches_w=num_patches_w)
-        else:
-            hidden_states, _ = self.attention(
-                hidden_states=hidden_states,
-                batch_info=batch_info,
-                attention_gate=attention_gate,
-                attention_mask=attention_mask,
-                patch_position_embeddings=patch_position_embeddings,
-                det_rope_embeddings=det_rope_embeddings,
-                det_temperature=det_temperature,
-            )
+        det_tokens = self.norm1(det_tokens)
+
+        hidden_states, det_tokens, _ = self.attention(
+            hidden_states=hidden_states,
+            det_tokens=det_tokens,
+            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
+            det_rope_cos_sin = det_rope_cos_sin,
+            det_temperatures = det_temperatures
+        )
 
         hidden_states = self.layer_scale1(hidden_states)
+        det_tokens = self.layer_scale1(det_tokens)
+
         hidden_states = self.drop_path(hidden_states) + residual
+        det_tokens = self.drop_path(det_tokens) + residual_det
 
         # MLP with residual connection
         residual = hidden_states
+        residual_det = det_tokens
+
         hidden_states = self.norm2(hidden_states)
+        det_tokens = self.norm2(det_tokens)
+
         hidden_states = self.mlp(hidden_states)
+        det_tokens = self.mlp(det_tokens)
+
         hidden_states = self.layer_scale2(hidden_states)
+        det_tokens = self.layer_scale2(det_tokens)
+
         hidden_states = self.drop_path(hidden_states) + residual
+        det_tokens = self.drop_path(det_tokens) + residual_det
 
-        if output_marginal_attention:
-            return hidden_states, marginal_attn
-        else:
-            return hidden_states
+        return hidden_states, det_tokens
 
+class GatedMLP(nn.Module):
+    def __init__(self, config, output_size):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.output_size = output_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(self.intermediate_size, self.output_size, bias=config.mlp_bias)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
+    
+class LocalizationHint(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config=config
+        self.location_embed = GatedMLP(config, 2)
+        self.temperature_embed = GatedMLP(config, 1)
+    
+    def forward(self, det_tokens):
+        coords = self.location_embed(det_tokens)
+        coords = F.tanh(coords)
+        temperatures = self.temperature_embed(det_tokens)
+        temperatures = F.sigmoid(temperatures)
+        cos_sin = get_rope_from_coords(config=self.config, coords=coords)
+
+        return cos_sin, temperatures
 
 class DINOv3ViTPreTrainedModel(PreTrainedModel):
     config: DINOv3ViTConfig
@@ -914,84 +734,60 @@ class DINOv3ViTPreTrainedModel(PreTrainedModel):
         elif isinstance(module, DINOv3ViTLayerScale):
             module.lambda1.data.fill_(self.config.layerscale_value)
 
-def get_det_gate(gate_type, info):
-    if gate_type is None:
-        return None
-    else:
-        device, num_tokens, det_e, det_s, patch_e= info['device'], info['num_tokens'], info['det_e'], info['det_s'], info['patch_e']
-        GATE_TYPES = {
-            "block_non_det_read_det":[ (slice(0, patch_e),slice(det_s,det_e))],
-            "block_all_read_det":[ (slice(0, num_tokens),slice(det_s,det_e))],
-        }
-        assert gate_type in GATE_TYPES.keys(), f"Unknown det_token_gate={gate_type}"
-        gate = torch.ones((num_tokens, num_tokens), dtype=torch.bool, device=device)
-
-        for qs, ks in GATE_TYPES[gate_type]:
-            gate[qs, ks] = False
-
-    return gate
-
     
 class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
-    def __init__(self, config: DINOv3ViTConfig, **kwargs):
+    def __init__(self, config: DINOv3ViTConfig):
         super().__init__(config)
         self.config = config
-
         self.embeddings = DINOv3ViTEmbeddings(config)
         self.rope_embeddings = DINOv3ViTRopePositionEmbedding(config)
         self.layer = nn.ModuleList([DINOv3ViTLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-
-        self.det_token_gate = config.det_token_gate
-        self.enable_det_rope = config.enable_det_rope
-        self.enable_det_additive_embeddings = config.enable_det_additive_embeddings
-        self.enable_det_additive_p = config.enable_det_additive_p
-
         self.gradient_checkpointing = False
+        # Initialize weights and apply final processing
         self.post_init()
 
-        if self.enable_det_rope:
-            self.det_rope = DetRopePositionEmbedding(config)
-            self.det_rope_type = config.det_rope_type
-            if self.det_rope_type == 'fixed':
-                n = self.config.num_det_tokens
-                hw = math.isqrt(n)
-                assert hw * hw == n, f"num_det_tokens must be a perfect square, got {n}"
-                coords = get_fixed_det_coordinates(num_h=hw, num_w=hw)
-                params = F.pad(coords, (0, 1), "constant", 0)
-                self.register_buffer("det_rope_params", params, persistent=False)
-            elif self.det_rope_type == 'learnable':
-                self.det_rope_params = nn.Parameter(torch.empty(self.config.num_hidden_layers, self.config.num_det_tokens, 3))
-                torch.nn.init.uniform_(self.det_rope_params, a=-1, b=1)
-            elif self.det_rope_type == 'adaptive':
-                self.det_rope_params = nn.Parameter(torch.empty(self.config.num_det_tokens, 3))
-                self.det_rope_updater = nn.ModuleList([DetRopeUpdater(config) for _ in range(config.num_hidden_layers)])
-                torch.nn.init.uniform_(self.det_rope_params, a=-1, b=1)
-            else:
-                raise ValueError(f'unknown det RoPE type {self.det_rope_type}')
+        self._init_det_q_proj_from_q_proj()
+
+        if config.use_loc_hint:
+            self.loc_hint = LocalizationHint(config)
+        else:
+            self.loc_hint = None
         
-        if self.enable_det_additive_embeddings:
-            self.det_additive_embeddings = nn.Parameter(torch.empty(self.config.num_hidden_layers, self.config.num_det_tokens, self.config.hidden_size))
-            nn.init.trunc_normal_(
-                self.det_additive_embeddings,
-                mean=0.0,
-                std=self.config.initializer_range,
-            )
-        if self.enable_det_additive_p:
-            # Learnable per-layer, per-det-token temperature (p). Initialized to 0 => exp(p)=1 (no behavior change).
-            self.det_additive_p = nn.Parameter(torch.empty(self.config.num_hidden_layers, self.config.num_det_tokens))
-            torch.nn.init.uniform_(self.det_additive_p, a=-1, b=1)
+        if config.use_det_rope:
+            if config.use_loc_hint:
+                self.det_coords = nn.Parameter(torch.empty(config.num_hidden_layers-1, config.num_det_tokens, 2))
+            else:
+                self.det_coords = nn.Parameter(torch.empty(config.num_hidden_layers, config.num_det_tokens, 2))
+            nn.init.uniform_(self.det_coords, -1.0, 1.0)
+        else:
+            self.det_coords = None
+
+    def _init_det_q_proj_from_q_proj(self) -> None:
+        for module in self.modules():
+            if not isinstance(module, DINOv3ViTAttention):
+                continue
+            with torch.no_grad():
+                if module.det_q_proj.weight.shape == module.q_proj.weight.shape:
+                    module.det_q_proj.weight.copy_(module.q_proj.weight)
+                if module.det_q_proj.bias is not None:
+                    if module.q_proj.bias is not None and module.det_q_proj.bias.shape == module.q_proj.bias.shape:
+                        module.det_q_proj.bias.copy_(module.q_proj.bias)
+                    else:
+                        module.det_q_proj.bias.zero_()
 
     def get_input_embeddings(self):
         return self.embeddings.patch_embeddings
 
-    @check_model_inputs
+    def get_input_embeddings(self):
+        return self.embeddings.patch_embeddings
+
     def forward(
         self,
         pixel_values: torch.Tensor,
         bool_masked_pos: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
-		**kwargs: Any,
+        **kwargs: Any,
     ) -> BaseModelOutputWithPooling:
         r"""
         bool_masked_pos (`torch.BoolTensor` of shape `(batch_size, sequence_length)`):
@@ -1000,129 +796,34 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         """
 
         pixel_values = pixel_values.to(self.embeddings.patch_embeddings.weight.dtype)
-        hidden_states = self.embeddings(pixel_values, bool_masked_pos=bool_masked_pos)
-
-        patch_size=self.config.patch_size
-        batch_size, _, height, width = pixel_values.shape
-        num_patches_h = height // patch_size
-        num_patches_w = width // patch_size
-        num_tokens = hidden_states.shape[1]
-        det_e = num_tokens
-        det_s = num_tokens - self.config.num_det_tokens
-        patch_e = det_s
-        patch_s = 1 + self.config.num_register_tokens
-        device = pixel_values.device
-        dtype = pixel_values.dtype
-        assert 0 <= patch_s <= patch_e <= det_s <= det_e == num_tokens
-        assert num_patches_h * num_patches_w == patch_e - patch_s
-        batch_info = {
-            'batch_size': batch_size,
-            'num_tokens':num_tokens,
-            'patch_s': patch_s,
-            'patch_e': patch_e,
-            'det_s': det_s,
-            'det_e': det_e,
-            'num_patches_h': num_patches_h,
-            'num_patches_w': num_patches_w,
-            'device': device,
-            'dtype': dtype
-        }
-
-        attention_gate = get_det_gate(gate_type=self.det_token_gate ,info=batch_info)
-        patch_position_embeddings = self.rope_embeddings(batch_info)
-
-        aux_layer_ids = (2, 5, 8)
-        aux_det_tokens = []
-        aux_rope_yx = []
-
-        self.aux_det_tokens = None
-        self.aux_rope_yx = None
-        
-        # For adaptive det RoPE, keep a per-forward, per-batch rope state.
-        rope_params = None
-        if self.enable_det_rope and self.det_rope_type == "adaptive":
-            rope_params = self.det_rope_params.unsqueeze(0).expand(batch_size, -1, -1)
+        hidden_states, det_tokens = self.embeddings(pixel_values, bool_masked_pos=bool_masked_pos)
+        position_embeddings = self.rope_embeddings(pixel_values)
 
         for i, layer_module in enumerate(self.layer):
             layer_head_mask = head_mask[i] if head_mask is not None else None
-
-            det_temperature = None
-
-            if self.enable_det_additive_embeddings:
-                det_e = hidden_states.shape[1]
-                det_s = det_e - self.config.num_det_tokens
-                hidden_states[:,det_s:det_e,:] += self.det_additive_embeddings[i]
-
-            if self.enable_det_additive_p:
-                # (N,) -> (B, N)
-                det_temperature = self.det_additive_p[i].view(1, -1).expand(batch_size, -1)
-            if self.enable_det_rope:
-                if self.det_rope_type == "adaptive":
-                    layer_det_rope_param = rope_params
-                else:
-                    layer_det_rope_param = self.det_rope_params if self.det_rope_params.dim() == 2 else self.det_rope_params[i]
-
-                coords = layer_det_rope_param[..., :2]
-                p = layer_det_rope_param[..., 2]
-                # Normalize p for broadcasting later
-                if p.dim() == 1:
-                    p = p.view(1, -1)
-
-                cos, sin = self.det_rope(coords, batch_info)
-                det_rope_embeddings = (cos, sin, p)
-                if self.det_rope_type == 'adaptive':
-                    hidden_states, marginal_attn = layer_module(
-                        hidden_states= hidden_states,
-                        batch_info=batch_info,
-                        attention_gate=attention_gate,
-                        attention_mask=layer_head_mask,
-                        patch_position_embeddings=patch_position_embeddings,
-                        det_rope_embeddings=det_rope_embeddings,
-                        det_temperature=det_temperature,
-                        output_marginal_attention=True,
-                    )
-                    marginal_attn = (marginal_attn[0].detach(), marginal_attn[1].detach())
-                    det_tokens_for_updater = hidden_states[:, det_s:det_e, :].detach()
-                    rope_params = self.det_rope_updater[i](
-                        rope_params=rope_params,
-                        marginal_attn=marginal_attn,
-                        det_tokens=det_tokens_for_updater,
-                    )
-
-                    if self.training and i in aux_layer_ids:
-                        aux_det_tokens.append(hidden_states[:, det_s:det_e, :])
-                        aux_rope_yx.append(rope_params[..., :2])
-                else:
-                    hidden_states = layer_module(
-                        hidden_states= hidden_states,
-                        batch_info=batch_info,
-                        attention_gate=attention_gate,
-                        attention_mask=layer_head_mask,
-                        patch_position_embeddings=patch_position_embeddings,
-                        det_rope_embeddings=det_rope_embeddings,
-                        det_temperature=det_temperature,
-                        output_marginal_attention=False,
-                    )
-            else:
-                hidden_states = layer_module(
-                    hidden_states= hidden_states,
-                    batch_info=batch_info,
-                    attention_gate=attention_gate,
-                    attention_mask=layer_head_mask,
-                    patch_position_embeddings=patch_position_embeddings,
-                    det_temperature=det_temperature,
-                    output_marginal_attention=False,
-                )
+            det_rope_cos_sin = None
+            det_temperatures = None
+            if self.loc_hint is not None and i == len(self.layer)-1:
+                det_rope_cos_sin, det_temperatures = self.loc_hint(det_tokens)
+            elif self.det_coords is not None and i < len(self.det_coords):
+                det_rope_cos_sin = get_rope_from_coords(config=self.config, coords=self.det_coords[i])
+            hidden_states, det_tokens = layer_module(
+                hidden_states = hidden_states,
+                det_tokens = det_tokens,
+                attention_mask=layer_head_mask,
+                position_embeddings=position_embeddings,
+                det_rope_cos_sin = det_rope_cos_sin,
+                det_temperatures = det_temperatures
+            )
 
         sequence_output = self.norm(hidden_states)
+        det_output = self.norm(det_tokens)
         pooled_output = sequence_output[:, 0, :]
 
-        if self.training and self.enable_det_rope and self.det_rope_type == "adaptive":
-            self.aux_det_tokens = aux_det_tokens if len(aux_det_tokens) > 0 else None
-            self.aux_rope_yx = aux_rope_yx if len(aux_rope_yx) > 0 else None
+        last_hidden_state = torch.cat((sequence_output, det_output), dim=1)
 
         return BaseModelOutputWithPooling(
-            last_hidden_state=sequence_output,
+            last_hidden_state=last_hidden_state,
             pooler_output=pooled_output,
         )
 
@@ -1130,23 +831,9 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
 class DINOv3Backbone(DINOv3ViTModel):
     def __init__(self, config: DINOv3ViTConfig, gate=False, **kwargs):
         super().__init__(config)
-        self.gate = gate
 
     def forward(self, x):
-        out = super().forward(x)
-        det_tokens = out.last_hidden_state[:, -self.config.num_det_tokens:, :]
-
-        aux_det_tokens = getattr(self, "aux_det_tokens", None)
-        aux_rope_yx = getattr(self, "aux_rope_yx", None)
-        return {
-            "det_tokens": det_tokens,
-            "aux_det_tokens": aux_det_tokens,
-            "aux_rope_yx": aux_rope_yx,
-        }
-    
-    @torch.jit.ignore
-    def get_attentions(self, x):
-        return torch.stack(super().forward(x).attentions)
+        return super().forward(x).last_hidden_state[:, -self.config.num_det_tokens:, :]
 
     @torch.jit.ignore
     def get_blocks(self):
@@ -1156,23 +843,61 @@ class DINOv3Backbone(DINOv3ViTModel):
     def init_unloaded_parameters(self, info):
         param_dict = dict(self.named_parameters())
 
-        unloaded = info.get("missing_keys", []) + info.get("mismatched_keys", [])
+        missing_keys = list(info.get("missing_keys", []) or [])
+        mismatched_keys = list(info.get("mismatched_keys", []) or [])
+        unloaded: list[str] = []
+        unloaded.extend(missing_keys)
+        for item in mismatched_keys:
+            unloaded.append(item[0] if isinstance(item, tuple) else item)
+
+        handled: set[str] = set()
 
         for name in unloaded:
+            if ".det_q_proj." not in name:
+                continue
+            if name not in param_dict:
+                continue
+
+            src_name = name.replace(".det_q_proj.", ".q_proj.")
+            dst_param = param_dict[name]
+
+            if src_name in param_dict and param_dict[src_name].shape == dst_param.shape:
+                with torch.no_grad():
+                    dst_param.copy_(param_dict[src_name])
+                handled.add(name)
+                continue
+
+            if name.endswith(".det_q_proj.bias"):
+                with torch.no_grad():
+                    dst_param.zero_()
+                handled.add(name)
+
+        for name in unloaded:
+            if name in handled:
+                continue
             if name in param_dict:
                 param = param_dict[name]
-                if "det_rope_params" in name.split(".") and param.data.dim() >= 2 and param.data.shape[-1] == 3:
+
+                if name == "det_coords" or name.startswith("det_coords."):
                     with torch.no_grad():
-                        param.data[..., :2].uniform_(-1, 1)
-                        param.data[..., 2:].uniform_(-1, 1)
-                elif "det_additive_p" in name.split(".") and param.data.dim() >= 1:
-                    with torch.no_grad():
-                        param.data.uniform_(-1, 1)
-                else:
-                    torch.nn.init.trunc_normal_(param.data, std=self.config.initializer_range)
+                        nn.init.uniform_(param.data, -1.0, 1.0)
+                    handled.add(name)
+                    continue
+
+                torch.nn.init.trunc_normal_(param.data, std=self.config.initializer_range)
 
 
-def build_dinov3(pretrained=None, output_attentions=False, **kwargs):
-    model, info = DINOv3Backbone.from_pretrained(pretrained, ignore_mismatched_sizes=True, output_loading_info=True, output_attentions=output_attentions, **kwargs)
+def build_dinov3(pretrained=None, **kwargs):
+    if pretrained is None or pretrained is False or pretrained == "":
+        config = DINOv3ViTConfig(**kwargs)
+        model = DINOv3Backbone(config)
+        return model, config.hidden_size
+
+    model, info = DINOv3Backbone.from_pretrained(
+        pretrained,
+        ignore_mismatched_sizes=True,
+        output_loading_info=True,
+        **kwargs,
+    )
     model.init_unloaded_parameters(info)
     return model, model.config.hidden_size
