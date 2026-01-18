@@ -27,6 +27,52 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.pytorch_utils import compile_compatible_method_lru_cache
 from transformers.configuration_utils import PretrainedConfig
 
+
+class LoRALinear(nn.Linear):
+    """A minimal LoRA-augmented Linear layer.
+
+    Keeps the original `weight`/`bias` parameter names (so pretrained checkpoints load cleanly),
+    and adds trainable low-rank adapters (lora_A/lora_B). LoRA can be toggled per forward call.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        r: int = 0,
+        lora_alpha: float = 1.0,
+        lora_dropout: float = 0.0,
+    ) -> None:
+        super().__init__(in_features, out_features, bias=bias)
+
+        self.r = int(r)
+        self.lora_alpha = float(lora_alpha)
+        self.lora_dropout = nn.Dropout(p=float(lora_dropout)) if lora_dropout and lora_dropout > 0.0 else nn.Identity()
+
+        if self.r > 0:
+            # A: (r, in), B: (out, r)
+            self.lora_A = nn.Parameter(torch.empty(self.r, in_features))
+            self.lora_B = nn.Parameter(torch.zeros(out_features, self.r))
+            self.scaling = self.lora_alpha / self.r
+            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        else:
+            self.lora_A = None
+            self.lora_B = None
+            self.scaling = 0.0
+
+    def forward(self, input: torch.Tensor, use_lora: bool = True) -> torch.Tensor:  # type: ignore[override]
+        out = F.linear(input, self.weight, self.bias)
+        if not use_lora or self.r <= 0 or self.lora_A is None or self.lora_B is None:
+            return out
+
+        x = self.lora_dropout(input)
+        # (B, *, in) @ (in, r) -> (B, *, r)
+        x = F.linear(x, self.lora_A)
+        # (B, *, r) @ (r, out) -> (B, *, out)
+        x = F.linear(x, self.lora_B)
+        return out + (x * self.scaling)
+
 class DINOv3ViTConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`DINOv3Model`]. It is used to instantiate an
@@ -138,6 +184,10 @@ class DINOv3ViTConfig(PretrainedConfig):
         # experiments
         num_det_tokens: int = 100,
         det_token_mode: str = "integrated",
+        # LoRA (used in `separate` det mode)
+        lora_r: int = 8,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -172,6 +222,11 @@ class DINOv3ViTConfig(PretrainedConfig):
         # experiments
         self.num_det_tokens = num_det_tokens
         self.det_token_mode = det_token_mode
+
+        # LoRA
+        self.lora_r = lora_r
+        self.lora_alpha = lora_alpha
+        self.lora_dropout = lora_dropout
 
 class DINOv3ViTEmbeddings(nn.Module):
     """
@@ -452,10 +507,39 @@ class DINOv3ViTAttention(nn.Module):
         det_mode = getattr(config, "det_token_mode", "integrated")
         det_mode = (det_mode or "integrated").lower() if isinstance(det_mode, str) else "integrated"
         if det_mode == "separate":
-            self.det_q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.query_bias)
-            self.det_k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.key_bias)
-            self.det_v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.value_bias)
-            self.det_o_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.proj_bias)
+            # Det branch: use LoRA so det can adapt while patch branch stays stable.
+            self.det_q_proj = LoRALinear(
+                self.embed_dim,
+                self.embed_dim,
+                bias=config.query_bias,
+                r=getattr(config, "lora_r", 0),
+                lora_alpha=getattr(config, "lora_alpha", 1.0),
+                lora_dropout=getattr(config, "lora_dropout", 0.0),
+            )
+            self.det_k_proj = LoRALinear(
+                self.embed_dim,
+                self.embed_dim,
+                bias=config.key_bias,
+                r=getattr(config, "lora_r", 0),
+                lora_alpha=getattr(config, "lora_alpha", 1.0),
+                lora_dropout=getattr(config, "lora_dropout", 0.0),
+            )
+            self.det_v_proj = LoRALinear(
+                self.embed_dim,
+                self.embed_dim,
+                bias=config.value_bias,
+                r=getattr(config, "lora_r", 0),
+                lora_alpha=getattr(config, "lora_alpha", 1.0),
+                lora_dropout=getattr(config, "lora_dropout", 0.0),
+            )
+            self.det_o_proj = LoRALinear(
+                self.embed_dim,
+                self.embed_dim,
+                bias=config.proj_bias,
+                r=getattr(config, "lora_r", 0),
+                lora_alpha=getattr(config, "lora_alpha", 1.0),
+                lora_dropout=getattr(config, "lora_dropout", 0.0),
+            )
         else:
             self.det_q_proj = None
             self.det_k_proj = None
@@ -586,9 +670,11 @@ class DINOv3ViTAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(q=query_states, k=key_states, cos=cos, sin=sin)
 
-        det_query_states = self.det_q_proj(det_tokens)
-        det_key_states = self.det_k_proj(hidden_states)
-        det_value_states = self.det_v_proj(hidden_states)
+        det_query_states = self.det_q_proj(det_tokens, use_lora=True)
+
+        det_memory = hidden_states.detach()
+        det_key_states = self.det_k_proj(det_memory, use_lora=True)
+        det_value_states = self.det_v_proj(det_memory, use_lora=True)
 
         det_query_states = det_query_states.view(batch_size, num_det_tokens, self.num_heads, self.head_dim).transpose(1, 2)
         det_key_states = det_key_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -646,13 +732,16 @@ class DINOv3ViTAttention(nn.Module):
             **kwargs,
         )
 
-        attn_weights = torch.cat((patch_attn_weights, det_attn_weights), dim=-2)
+        if patch_attn_weights is None or det_attn_weights is None:
+            attn_weights = None
+        else:
+            attn_weights = torch.cat((patch_attn_weights, det_attn_weights), dim=-2)
 
         patch_attn_output = patch_attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
         det_attn_output = det_attn_output.transpose(1, 2).reshape(batch_size, num_det_tokens, -1).contiguous()
 
         out_hidden = self.o_proj(patch_attn_output)
-        out_det = self.det_o_proj(det_attn_output)
+        out_det = self.det_o_proj(det_attn_output, use_lora=True)
 
         return out_hidden, out_det, attn_weights
 
@@ -706,12 +795,29 @@ class DINOv3ViTMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        r = getattr(config, "lora_r", 0)
+        lora_alpha = getattr(config, "lora_alpha", 1.0)
+        lora_dropout = getattr(config, "lora_dropout", 0.0)
+        self.up_proj = LoRALinear(
+            self.hidden_size,
+            self.intermediate_size,
+            bias=config.mlp_bias,
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+        )
+        self.down_proj = LoRALinear(
+            self.intermediate_size,
+            self.hidden_size,
+            bias=config.mlp_bias,
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
-        return self.down_proj(self.act_fn(self.up_proj(x)))
+    def forward(self, x, use_lora: bool = False):
+        return self.down_proj(self.act_fn(self.up_proj(x, use_lora=use_lora)), use_lora=use_lora)
 
 
 class DINOv3ViTGatedMLP(nn.Module):
@@ -720,13 +826,39 @@ class DINOv3ViTGatedMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        r = getattr(config, "lora_r", 0)
+        lora_alpha = getattr(config, "lora_alpha", 1.0)
+        lora_dropout = getattr(config, "lora_dropout", 0.0)
+        self.gate_proj = LoRALinear(
+            self.hidden_size,
+            self.intermediate_size,
+            bias=config.mlp_bias,
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+        )
+        self.up_proj = LoRALinear(
+            self.hidden_size,
+            self.intermediate_size,
+            bias=config.mlp_bias,
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+        )
+        self.down_proj = LoRALinear(
+            self.intermediate_size,
+            self.hidden_size,
+            bias=config.mlp_bias,
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    def forward(self, x, use_lora: bool = False):
+        gated = self.act_fn(self.gate_proj(x, use_lora=use_lora))
+        up = self.up_proj(x, use_lora=use_lora)
+        down_proj = self.down_proj(gated * up, use_lora=use_lora)
         return down_proj
 
 
@@ -803,7 +935,7 @@ class DINOv3ViTLayer(GradientCheckpointingLayer):
         det_tokens = self.norm2(det_tokens) if det_mode == "integrated" else self.det_norm2(det_tokens)
 
         hidden_states = self.mlp(hidden_states)
-        det_tokens = self.mlp(det_tokens)
+        det_tokens = self.mlp(det_tokens, use_lora=(det_mode == "separate"))
 
         hidden_states = self.layer_scale2(hidden_states)
         det_tokens = self.layer_scale2(det_tokens) if det_mode == "integrated" else self.det_layer_scale2(det_tokens)

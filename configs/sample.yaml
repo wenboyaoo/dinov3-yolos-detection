@@ -23,11 +23,18 @@ det_token_mode: integrated # ['integrated', 'separate']
 backbone: dinov3 # options: ["vanilla_vit", "dinov3"]
 pretrained: facebook/dinov3-vits16-pretrain-lvd1689m
 backbone_size: small
+
+lora_r: 8
+lora_alpha: 16.0
+lora_dropout: 0.0
+
 unfreeze: 
   - class_embed
   - bbox_embed
   - det_tokens
   - det_coords
+  - lora_A
+  - lora_B
   - det_q_proj
   - det_k_proj
   - det_v_proj

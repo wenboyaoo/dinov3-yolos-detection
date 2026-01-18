@@ -162,9 +162,25 @@ def main(args):
     def build_optimizer(model, args):
         skip = args.no_weight_decay
         head = []
+        det_alpha = []
+        lora_params = []
         backbone_decay = []
         backbone_no_decay = []
         for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            # Per-layer det attention residual gate (alpha): train faster than the backbone.
+            # Name comes from dinov3: backbone.layer.*.det_layer_scale1.alpha
+            if name.endswith(".det_layer_scale1.alpha"):
+                det_alpha.append(param)
+                continue
+
+            # LoRA adapters: train faster than the backbone, no weight decay.
+            if name.endswith(".lora_A") or name.endswith(".lora_B"):
+                lora_params.append(param)
+                continue
+
             if "backbone" not in name and param.requires_grad:
                 head.append(param)
             if "backbone" in name and param.requires_grad:
@@ -174,6 +190,8 @@ def main(args):
                     backbone_decay.append(param)
         param_dicts = [
             {"params": head},
+            {"params": det_alpha, "weight_decay": 0.0, "lr": args.backbone_lr * 10.0},
+            {"params": lora_params, "weight_decay": 0.0, "lr": args.backbone_lr * 10.0},
             {"params": backbone_no_decay, "weight_decay": 0., "lr": args.backbone_lr},
             {"params": backbone_decay, "lr": args.backbone_lr},
         ]
