@@ -137,7 +137,6 @@ class DINOv3ViTConfig(PretrainedConfig):
         pos_embed_rescale: Optional[float] = None,
         # experiments
         num_det_tokens: int = 100,
-        use_det_rope: bool = False,
         det_token_mode: str = "integrated",
         **kwargs,
     ):
@@ -172,7 +171,6 @@ class DINOv3ViTConfig(PretrainedConfig):
 
         # experiments
         self.num_det_tokens = num_det_tokens
-        self.use_det_rope = use_det_rope
         self.det_token_mode = det_token_mode
 
 class DINOv3ViTEmbeddings(nn.Module):
@@ -365,6 +363,34 @@ def apply_rotary_pos_emb_q(
     return (q * cos) + (rotate_half(q) * sin)
 
 
+def apply_rotary_pos_emb_k(
+    k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, **kwargs
+) -> torch.Tensor:
+    """Applies Rotary Position Embedding to the key tensor, but only to the patch tokens,
+    ignoring the prefix tokens (cls/register). This is useful for cross-attention where q
+    does not have the same seq_len as k.
+    """
+    k_len = k.shape[-2]
+    num_patches = sin.shape[-2]
+    num_prefix_tokens = k_len - num_patches
+    if num_prefix_tokens < 0:
+        raise ValueError(
+            f"RoPE patch count ({num_patches}) exceeds key length ({k_len}). "
+        )
+
+    start = num_prefix_tokens
+    end = k_len
+    k_tokens = k[..., start:end, :]
+
+    cos = cos.to(device=k_tokens.device, dtype=k_tokens.dtype)
+    sin = sin.to(device=k_tokens.device, dtype=k_tokens.dtype)
+
+    k_rot = (k_tokens * cos) + (rotate_half(k_tokens) * sin)
+    k_out = k.clone()
+    k_out[..., start:end, :] = k_rot
+    return k_out
+
+
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -427,9 +453,13 @@ class DINOv3ViTAttention(nn.Module):
         det_mode = (det_mode or "integrated").lower() if isinstance(det_mode, str) else "integrated"
         if det_mode == "separate":
             self.det_q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.query_bias)
+            self.det_k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.key_bias)
+            self.det_v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.value_bias)
             self.det_o_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.proj_bias)
         else:
             self.det_q_proj = None
+            self.det_k_proj = None
+            self.det_v_proj = None
             self.det_o_proj = None
 
     def _get_det_token_mode(self) -> str:
@@ -540,15 +570,29 @@ class DINOv3ViTAttention(nn.Module):
                 "det_token_mode='separate' requires det-specific projections (det_q_proj/det_o_proj), "
                 "but this model was instantiated without them. Rebuild the backbone with det_token_mode='separate'."
             )
+        if self.det_k_proj is None or self.det_v_proj is None:
+            raise RuntimeError(
+                "det_token_mode='separate' requires det-specific projections (det_q_proj/det_k_proj/det_v_proj/det_o_proj), "
+                "but this model was instantiated without them. Rebuild the backbone with det_token_mode='separate'."
+            )
         query_states = self.q_proj(hidden_states)
-        det_query_states = self.det_q_proj(det_tokens)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
         query_states = query_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        det_query_states = det_query_states.view(batch_size, num_det_tokens, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(q=query_states, k=key_states, cos=cos, sin=sin)
+
+        det_query_states = self.det_q_proj(det_tokens)
+        det_key_states = self.det_k_proj(hidden_states)
+        det_value_states = self.det_v_proj(hidden_states)
+
+        det_query_states = det_query_states.view(batch_size, num_det_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+        det_key_states = det_key_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        det_value_states = det_value_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         if det_rope_cos_sin is not None:
             det_cos, det_sin = det_rope_cos_sin
@@ -575,17 +619,13 @@ class DINOv3ViTAttention(nn.Module):
             det_sin = det_sin.to(device=det_query_states.device, dtype=det_query_states.dtype)
             det_query_states = (det_query_states * det_cos) + (rotate_half(det_query_states) * det_sin)
 
-        query_states = torch.cat((query_states, det_query_states), dim=2)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(q=query_states, k=key_states, cos=cos, sin=sin)
-
+        det_key_states = apply_rotary_pos_emb_k(k=det_key_states, cos=cos, sin=sin)
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        attn_output, attn_weights = attention_interface(
+        patch_attn_output, patch_attn_weights = attention_interface(
             self,
             query_states,
             key_states,
@@ -595,11 +635,24 @@ class DINOv3ViTAttention(nn.Module):
             scaling=self.scaling,
             **kwargs,
         )
+        det_attn_output, det_attn_weights = attention_interface(
+            self,
+            det_query_states,
+            det_key_states,
+            det_value_states,
+            attention_mask,
+            dropout=0.0,
+            scaling=self.scaling,
+            **kwargs,
+        )
 
-        attn_output = attn_output.reshape(batch_size, len_q, -1).contiguous()
+        attn_weights = torch.cat((patch_attn_weights, det_attn_weights), dim=-2)
 
-        out_hidden = self.o_proj(attn_output[:, :seq_len, :])
-        out_det = self.det_o_proj(attn_output[:, seq_len:, :])
+        patch_attn_output = patch_attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
+        det_attn_output = det_attn_output.transpose(1, 2).reshape(batch_size, num_det_tokens, -1).contiguous()
+
+        out_hidden = self.o_proj(patch_attn_output)
+        out_det = self.det_o_proj(det_attn_output)
 
         return out_hidden, out_det, attn_weights
 
@@ -831,17 +884,17 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        self.det_coords = nn.Parameter(torch.empty(config.num_hidden_layers, config.num_det_tokens, 2))
+        nn.init.uniform_(self.det_coords, -1.0, 1.0)
+
         if det_mode == "separate":
             self._init_det_q_proj_from_q_proj()
+            self._init_det_k_proj_from_k_proj()
+            self._init_det_v_proj_from_v_proj()
             self._init_det_o_proj_from_o_proj()
             self._init_det_norms_from_shared()
             self._init_det_layer_scales_from_shared()
         
-        if config.use_det_rope:
-            self.det_coords = nn.Parameter(torch.empty(config.num_hidden_layers, config.num_det_tokens, 2))
-            nn.init.uniform_(self.det_coords, -1.0, 1.0)
-        else:
-            self.det_coords = None
 
     def _init_det_q_proj_from_q_proj(self) -> None:
         for module in self.modules():
@@ -872,6 +925,36 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
                         module.det_o_proj.bias.copy_(module.o_proj.bias)
                     else:
                         module.det_o_proj.bias.zero_()
+
+    def _init_det_k_proj_from_k_proj(self) -> None:
+        for module in self.modules():
+            if not isinstance(module, DINOv3ViTAttention):
+                continue
+            if getattr(module, "det_k_proj", None) is None:
+                continue
+            with torch.no_grad():
+                if module.det_k_proj.weight.shape == module.k_proj.weight.shape:
+                    module.det_k_proj.weight.copy_(module.k_proj.weight)
+                if module.det_k_proj.bias is not None:
+                    if module.k_proj.bias is not None and module.det_k_proj.bias.shape == module.k_proj.bias.shape:
+                        module.det_k_proj.bias.copy_(module.k_proj.bias)
+                    else:
+                        module.det_k_proj.bias.zero_()
+
+    def _init_det_v_proj_from_v_proj(self) -> None:
+        for module in self.modules():
+            if not isinstance(module, DINOv3ViTAttention):
+                continue
+            if getattr(module, "det_v_proj", None) is None:
+                continue
+            with torch.no_grad():
+                if module.det_v_proj.weight.shape == module.v_proj.weight.shape:
+                    module.det_v_proj.weight.copy_(module.v_proj.weight)
+                if module.det_v_proj.bias is not None:
+                    if module.v_proj.bias is not None and module.det_v_proj.bias.shape == module.v_proj.bias.shape:
+                        module.det_v_proj.bias.copy_(module.v_proj.bias)
+                    else:
+                        module.det_v_proj.bias.zero_()
 
     def _init_det_norms_from_shared(self) -> None:
         if self.det_norm is not None:
@@ -935,9 +1018,7 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
 
         for i, layer_module in enumerate(self.layer):
             layer_head_mask = head_mask[i] if head_mask is not None else None
-            det_rope_cos_sin = None
-            if self.det_coords is not None and i < len(self.det_coords):
-                det_rope_cos_sin = get_rope_from_coords(config=self.config, coords=self.det_coords[i])
+            det_rope_cos_sin = get_rope_from_coords(config=self.config, coords=self.det_coords[i])
             hidden_states, det_tokens = layer_module(
                 hidden_states = hidden_states,
                 det_tokens = det_tokens,
@@ -998,6 +1079,8 @@ class DINOv3Backbone(DINOv3ViTModel):
 
             copy_map = {
                 ".det_q_proj.": ".q_proj.",
+                ".det_k_proj.": ".k_proj.",
+                ".det_v_proj.": ".v_proj.",
                 ".det_o_proj.": ".o_proj.",
                 ".det_norm1.": ".norm1.",
                 ".det_norm2.": ".norm2.",

@@ -28,6 +28,8 @@ unfreeze:
   - det_tokens
   - det_coords
   - det_q_proj
+  - det_k_proj
+  - det_v_proj
   - det_o_proj
   - det_norm1
   - det_norm2
@@ -64,7 +66,5 @@ start_epoch: 0
 num_workers: 32
 
 # experiments
-## routing
 det_token_mode: integrated # ['integrated', 'separate']
-## det position embedding
 use_det_rope: False
