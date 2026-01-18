@@ -103,76 +103,25 @@ class SetCriterion(nn.Module):
         empty_weight[-1] = self.eos_coef
         self.register_buffer('empty_weight', empty_weight)
 
-    def loss_labels(self, outputs, targets, indices, num_boxes, log=True, weights=None, bg_weights=None):
+    def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
         assert 'pred_logits' in outputs
         src_logits = outputs['pred_logits']
-        
-        if self.matcher.backup_matching:
-            # Backup matching logic (VRAM-friendly):
-            # - avoid building a [B, C, Ndt, Ngt] tensor for cross_entropy
-            # - use log_softmax + gather
-            bs, n_dt, _ = src_logits.shape
 
-            # Concatenate all target labels from the batch
-            tgt_labels = torch.cat([t["labels"] for t in targets])
-            n_gt_total = int(tgt_labels.numel())
+        idx = self._get_src_permutation_idx(indices)
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
+                                    dtype=torch.int64, device=src_logits.device)
+        target_classes[idx] = target_classes_o
 
-            # Ensure dtype/device
-            tgt_labels = tgt_labels.to(device=src_logits.device, dtype=torch.long)
+        empty_weight = self.empty_weight.to(dtype=src_logits.dtype, device=src_logits.device)
+        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, empty_weight)
+        losses = {'loss_ce': loss_ce}
 
-            # log_probs: [B, Ndt, C]
-            log_probs = F.log_softmax(src_logits, dim=-1)
-
-            # --- Negative (no-object) loss ---
-            # nll_bg: [B, Ndt]
-            nll_bg = -log_probs[..., self.num_classes]
-            weighted_neg_loss = (nll_bg * (self.eos_coef * bg_weights)).sum()
-
-            if n_gt_total == 0:
-                # Only background when no GT exists.
-                loss_ce = weighted_neg_loss / num_boxes
-                losses = {'loss_ce': loss_ce}
-                if log:
-                    losses['class_error'] = torch.tensor(0.0, device=src_logits.device)
-                return losses
-
-            # --- Positive loss ---
-            # Build index tensor [B, Ndt, Ngt_total] and gather log-probs at GT classes.
-            tgt_labels_exp = tgt_labels.view(1, 1, -1).expand(bs, n_dt, -1)
-            # gathered_logp: [B, Ndt, Ngt_total]
-            gathered_logp = torch.gather(log_probs, dim=2, index=tgt_labels_exp)
-            pos_nll = -gathered_logp
-            weighted_pos_loss = (pos_nll * weights).sum()
-
-            loss_ce = (weighted_pos_loss + weighted_neg_loss) / num_boxes
-            losses = {'loss_ce': loss_ce}
-
-            # Log class error based on Hungarian matching
-            if log:
-                idx = self._get_src_permutation_idx(indices)
-                if len(idx) > 0 and len(idx[0]) > 0:
-                    target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-                    losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
-                else:
-                    losses['class_error'] = torch.tensor(0.0, device=src_logits.device)
-
-        else:
-            # Original logic
-            idx = self._get_src_permutation_idx(indices)
-            target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-            target_classes = torch.full(src_logits.shape[:2], self.num_classes,
-                                        dtype=torch.int64, device=src_logits.device)
-            target_classes[idx] = target_classes_o
-
-            empty_weight = self.empty_weight.to(dtype=src_logits.dtype, device=src_logits.device)
-            loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, empty_weight)
-            losses = {'loss_ce': loss_ce}
-
-            if log:
-                losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
+        if log:
+            losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
         return losses
 
     @torch.no_grad()
@@ -189,95 +138,26 @@ class SetCriterion(nn.Module):
         losses = {'cardinality_error': card_err}
         return losses
 
-    def loss_boxes(self, outputs, targets, indices, num_boxes, weights=None, bg_weights=None):
+    def loss_boxes(self, outputs, targets, indices, num_boxes):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
            The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
         """
         assert 'pred_boxes' in outputs
-        
-        if self.matcher.backup_matching:
-            # Backup matching logic
-            src_boxes = outputs['pred_boxes'] # [bs, n_dt, 4]
-            tgt_boxes = torch.cat([t['boxes'] for t in targets], dim=0) # [n_gt_total, 4]
-            
-            bs, n_dt, _ = src_boxes.shape
-            n_gt_total = tgt_boxes.shape[0]
 
-            if n_gt_total == 0:
-                # No GTs, no box loss
-                return {'loss_bbox': torch.tensor(0.0, device=src_boxes.device), 
-                        'loss_giou': torch.tensor(0.0, device=src_boxes.device)}
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs['pred_boxes'][idx]
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
-            # Expand src and tgt boxes to calculate all-pairs losses
-            # src_boxes_exp: [bs, n_dt, n_gt_total, 4]
-            # tgt_boxes_exp: [bs, n_dt, n_gt_total, 4]
-            src_boxes_exp = src_boxes.unsqueeze(2).expand(-1, -1, n_gt_total, -1)
-            tgt_boxes_exp = tgt_boxes.unsqueeze(0).unsqueeze(0).expand(bs, n_dt, -1, -1)
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
 
-            # L1 loss for all pairs
-            loss_bbox_all = F.l1_loss(src_boxes_exp, tgt_boxes_exp, reduction='none')
-            # A box should only contribute to loss if it's a foreground object.
-            # The total foreground probability for a DT_j is (1 - bg_weight_j).
-            # The formula is Sum_j( (1-W_bg,j) * Sum_i( W_ij' * L(j,i) ) ), where W_ij' is the normalized weight.
-            # A simpler, equivalent formulation is just to sum the weighted losses, as W_ij is already 0 for background boxes.
-            weighted_loss_bbox = (loss_bbox_all * weights.unsqueeze(-1)).sum()
+        losses = {}
+        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
 
-            # GIoU loss for all pairs (VRAM-friendly): compute aligned GIoU per element,
-            # NOT an NxN matrix from generalized_box_iou.
-            src_xyxy = box_ops.box_cxcywh_to_xyxy(src_boxes_exp)
-            tgt_xyxy = box_ops.box_cxcywh_to_xyxy(tgt_boxes_exp)
-
-            # Compute generalized IoU for aligned pairs (elementwise)
-            # Shapes: [..., 4] -> [...]
-            # Use float32 for stability
-            src_xyxy_f = src_xyxy.float()
-            tgt_xyxy_f = tgt_xyxy.float()
-
-            x1 = torch.maximum(src_xyxy_f[..., 0], tgt_xyxy_f[..., 0])
-            y1 = torch.maximum(src_xyxy_f[..., 1], tgt_xyxy_f[..., 1])
-            x2 = torch.minimum(src_xyxy_f[..., 2], tgt_xyxy_f[..., 2])
-            y2 = torch.minimum(src_xyxy_f[..., 3], tgt_xyxy_f[..., 3])
-            inter_w = (x2 - x1).clamp(min=0)
-            inter_h = (y2 - y1).clamp(min=0)
-            inter = inter_w * inter_h
-
-            area1 = (src_xyxy_f[..., 2] - src_xyxy_f[..., 0]).clamp(min=0) * (src_xyxy_f[..., 3] - src_xyxy_f[..., 1]).clamp(min=0)
-            area2 = (tgt_xyxy_f[..., 2] - tgt_xyxy_f[..., 0]).clamp(min=0) * (tgt_xyxy_f[..., 3] - tgt_xyxy_f[..., 1]).clamp(min=0)
-            union = (area1 + area2 - inter).clamp(min=1e-10)
-            iou = inter / union
-
-            cx1 = torch.minimum(src_xyxy_f[..., 0], tgt_xyxy_f[..., 0])
-            cy1 = torch.minimum(src_xyxy_f[..., 1], tgt_xyxy_f[..., 1])
-            cx2 = torch.maximum(src_xyxy_f[..., 2], tgt_xyxy_f[..., 2])
-            cy2 = torch.maximum(src_xyxy_f[..., 3], tgt_xyxy_f[..., 3])
-            c_w = (cx2 - cx1).clamp(min=0)
-            c_h = (cy2 - cy1).clamp(min=0)
-            area_c = (c_w * c_h).clamp(min=1e-10)
-
-            giou = iou - (area_c - union) / area_c
-            loss_giou_all = (1.0 - giou).to(dtype=src_boxes.dtype)
-            weighted_loss_giou = (loss_giou_all * weights).sum()
-
-            losses = {}
-            losses['loss_bbox'] = weighted_loss_bbox / num_boxes
-            losses['loss_giou'] = weighted_loss_giou / num_boxes
-
-        else:
-            # Original logic
-            idx = self._get_src_permutation_idx(indices)
-            src_boxes = outputs['pred_boxes'][idx]
-            target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-
-            loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
-
-            losses = {}
-            losses['loss_bbox'] = loss_bbox.sum() / num_boxes
-
-            loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
-                box_ops.box_cxcywh_to_xyxy(src_boxes),
-                box_ops.box_cxcywh_to_xyxy(target_boxes)))
-            losses['loss_giou'] = loss_giou.sum() / num_boxes
+        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
+            box_ops.box_cxcywh_to_xyxy(src_boxes),
+            box_ops.box_cxcywh_to_xyxy(target_boxes)))
+        losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
 
     def _get_src_permutation_idx(self, indices):
@@ -309,16 +189,7 @@ class SetCriterion(nn.Module):
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
         # Retrieve the matching between the outputs of the last layer and the targets
-        match_results = self.matcher(outputs, targets)
-        
-        if self.matcher.backup_matching:
-            indices_h = match_results['indices']
-            weights = match_results['weights']
-            bg_weights = match_results['bg_weights']
-        else:
-            indices_h = match_results
-            weights = None
-            bg_weights = None
+        indices_h = self.matcher(outputs, targets)
 
         # Normalization for matcher-only logging
         num_boxes_log = sum(len(t["labels"]) for t in targets)
@@ -329,13 +200,8 @@ class SetCriterion(nn.Module):
 
         losses = {}
 
-        # Log/print: only Hungarian-matched tokens
-        if self.matcher.backup_matching:
-            losses.update(self.loss_labels(outputs, targets, indices_h, num_boxes_log, log=True, weights=weights, bg_weights=bg_weights))
-            losses.update(self.loss_boxes(outputs, targets, indices_h, num_boxes_log, weights=weights, bg_weights=bg_weights))
-        else:
-            losses.update(self.loss_labels(outputs, targets, indices_h, num_boxes_log, log=True))
-            losses.update(self.loss_boxes(outputs, targets, indices_h, num_boxes_log))
+        losses.update(self.loss_labels(outputs, targets, indices_h, num_boxes_log, log=True))
+        losses.update(self.loss_boxes(outputs, targets, indices_h, num_boxes_log))
         
         losses.update(self.loss_cardinality(outputs, targets, indices_h, num_boxes_log))
         return losses

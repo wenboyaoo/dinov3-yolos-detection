@@ -113,11 +113,6 @@ def get_args_parser():
                         help='Enable bfloat16 mixed precision training')
 
     parser.add_argument('--config-file',default=None, help='path to .yaml configuration file')
-    # matcher backup matching options
-    parser.add_argument('--backup-matching', action='store_true')
-    parser.add_argument('--backup-k-scale', default=0.2, type=float)
-    parser.add_argument('--backup-top-k', default=5, type=int)
-    parser.add_argument('--backup-class-ids', nargs='+', type=int, default=[])
 
     return parser
 

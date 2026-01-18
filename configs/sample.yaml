@@ -68,8 +68,3 @@ num_workers: 32
 det_token_mode: integrated # ['integrated', 'separate']
 ## det position embedding
 use_det_rope: False
-## backup matching
-backup_matching: False
-backup_class_ids: []
-backup_k_scale: 4
-backup_top_k: 5
