@@ -2,12 +2,12 @@ lr: 8.0e-4
 backbone_lr: 8.0e-5
 batch_size: 16
 weight_decay: 5.0e-4
-epochs: 75
+epochs: 300
 clip_max_norm: 0.1
 bf16: True
 eval_during_training: True
-eval_epochs: 1
-save_epochs: 25
+eval_epochs: 5
+save_epochs: 30
 
 # scheduler
 sched: warmupcos # options: ["step", "warmupcos"]
@@ -27,11 +27,13 @@ unfreeze:
   - bbox_embed
   - det_tokens
   - det_coords
-#  - det_q_proj
-#  - det_v_proj
-#  - q_proj
-#  - k_proj
-#  - v_proj
+  - det_q_proj
+  - det_o_proj
+  - det_norm1
+  - det_norm2
+  - det_layer_scale1
+  - det_layer_scale2
+  - det_norm
 no_weight_decay:
   - det_tokens
   - det_coords
@@ -59,14 +61,15 @@ seed: 42
 resume: # resume from checkpoint
 eval: False
 start_epoch: 0
-num_workers: 64
+num_workers: 32
 
 # experiments
-det_attn_proj_mode: full # ['full', 'separate', 'q', 'v', 'qv']
-## det_rope
+## routing
+det_token_mode: integrated # ['integrated', 'separate']
+## det position embedding
 use_det_rope: False
 ## backup matching
 backup_matching: False
 backup_class_ids: []
 backup_k_scale: 4
-backup_top_k: 10
+backup_top_k: 5

@@ -85,6 +85,64 @@ class SmoothedValue(object):
             value=self.value)
 
 
+def load_state_dict_flexible(model: torch.nn.Module, state_dict: dict) -> dict:
+    """Loads a checkpoint state_dict into model, tolerating missing/unexpected keys and *skipping* shape mismatches.
+
+    Returns an info dict compatible with init_unloaded_parameters():
+      - missing_keys: list[str]
+      - unexpected_keys: list[str]
+      - mismatched_keys: list[tuple[str, tuple, tuple]]  (name, ckpt_shape, model_shape)
+    """
+
+    model_state = model.state_dict()
+    filtered_state: dict = {}
+    unexpected_keys: list[str] = []
+    mismatched_keys: list[tuple[str, tuple, tuple]] = []
+
+    for name, value in state_dict.items():
+        if name not in model_state:
+            unexpected_keys.append(name)
+            continue
+        if hasattr(model_state[name], "shape") and hasattr(value, "shape") and model_state[name].shape != value.shape:
+            mismatched_keys.append((name, tuple(value.shape), tuple(model_state[name].shape)))
+            continue
+        filtered_state[name] = value
+
+    load_res = model.load_state_dict(filtered_state, strict=False)
+
+    # Note: load_res.missing_keys will include both truly-missing keys and keys we dropped due to mismatch.
+    info = {
+        "missing_keys": list(load_res.missing_keys),
+        "unexpected_keys": list(unexpected_keys),
+        "mismatched_keys": list(mismatched_keys),
+    }
+    return info
+
+
+def filter_loading_info_by_prefix(info: dict, prefix: str) -> dict:
+    """Filters a load_state_dict_flexible info dict to a submodule, stripping the given prefix."""
+
+    def _strip(name: str) -> str:
+        return name[len(prefix) :] if name.startswith(prefix) else name
+
+    missing_keys = [_strip(k) for k in info.get("missing_keys", []) if isinstance(k, str) and k.startswith(prefix)]
+    unexpected_keys = [_strip(k) for k in info.get("unexpected_keys", []) if isinstance(k, str) and k.startswith(prefix)]
+    mismatched_keys = []
+    for item in info.get("mismatched_keys", []) or []:
+        if not isinstance(item, tuple) or len(item) < 1:
+            continue
+        name = item[0]
+        if isinstance(name, str) and name.startswith(prefix):
+            # Keep the rest of tuple as-is (shapes, etc.)
+            mismatched_keys.append((_strip(name), *item[1:]))
+
+    return {
+        "missing_keys": missing_keys,
+        "unexpected_keys": unexpected_keys,
+        "mismatched_keys": mismatched_keys,
+    }
+
+
 def all_gather(data):
     """
     Run all_gather on arbitrary picklable data (not necessarily tensors)

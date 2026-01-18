@@ -217,11 +217,24 @@ def main(args):
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-        model.load_state_dict(checkpoint['model'])
+        ckpt_model = checkpoint.get('model', checkpoint)
+        info = utils.load_state_dict_flexible(model, ckpt_model)
+
+        # If the detector has a backbone with custom initialization rules, apply them to missing/mismatched params.
+        if hasattr(model, 'backbone') and hasattr(model.backbone, 'init_unloaded_parameters'):
+            backbone_info = utils.filter_loading_info_by_prefix(info, prefix='backbone.')
+            try:
+                model.backbone.init_unloaded_parameters(backbone_info)
+            except Exception as e:
+                print(f"[resume] backbone.init_unloaded_parameters failed: {e}")
+
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            args.start_epoch = checkpoint['epoch'] + 1
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+                args.start_epoch = checkpoint['epoch'] + 1
+            except Exception as e:
+                print(f"[resume] optimizer/lr_scheduler state not loaded (param groups changed?): {e}")
 
     if args.eval:
         test_stats, evaluator_obj = evaluate(
@@ -284,9 +297,8 @@ def main(args):
                 output_dir=args.output_dir,
                 use_bf16=args.bf16,
             )
-            log_stats = {**{f'test_{k}': v for k, v in test_stats.items()},
-                        'epoch': epoch,
-                        'n_parameters': n_parameters}
+            # Keep train stats and append eval stats for the same epoch.
+            log_stats.update({f'test_{k}': v for k, v in test_stats.items()})
             # for COCO evaluation logs
             if args.evaluator == 'coco' and evaluator_obj is not None:
                 (output_dir / 'eval').mkdir(exist_ok=True)
