@@ -1018,7 +1018,10 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
 
         for i, layer_module in enumerate(self.layer):
             layer_head_mask = head_mask[i] if head_mask is not None else None
-            det_rope_cos_sin = get_rope_from_coords(config=self.config, coords=self.det_coords[i])
+            det_coords = self.det_coords[i]
+            det_coords_clamped = det_coords.clamp(-1.0, 1.0)
+            det_coords = det_coords + (det_coords_clamped - det_coords).detach()
+            det_rope_cos_sin = get_rope_from_coords(config=self.config, coords=det_coords)
             hidden_states, det_tokens = layer_module(
                 hidden_states = hidden_states,
                 det_tokens = det_tokens,
