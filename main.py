@@ -176,6 +176,11 @@ def main(args):
                 det_alpha.append(param)
                 continue
 
+            # Integrated-mode det attention alpha and det attention temperature.
+            if name.endswith(".det_attn_alpha") or name.endswith(".det_cross_attn_log_temp"):
+                det_alpha.append(param)
+                continue
+
             # LoRA adapters: train faster than the backbone, no weight decay.
             if name.endswith(".lora_A") or name.endswith(".lora_B"):
                 lora_params.append(param)
@@ -184,7 +189,7 @@ def main(args):
             if "backbone" not in name and param.requires_grad:
                 head.append(param)
             if "backbone" in name and param.requires_grad:
-                if len(param.shape) == 1 or name.endswith(".bias") or name.split('.')[-1] in skip:
+                if len(param.shape) <= 1 or name.endswith(".bias") or name.split('.')[-1] in skip:
                     backbone_no_decay.append(param)
                 else:
                     backbone_decay.append(param)

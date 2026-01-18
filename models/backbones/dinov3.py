@@ -184,6 +184,10 @@ class DINOv3ViTConfig(PretrainedConfig):
         # experiments
         num_det_tokens: int = 100,
         det_token_mode: str = "integrated",
+        # switches (work for both integrated / separate)
+        use_det_attn_alpha: bool = False,
+        use_det_attn_temp: bool = False,
+        use_det_dynamic_rope_coords: bool = False,
         # LoRA (used in `separate` det mode)
         lora_r: int = 8,
         lora_alpha: float = 16.0,
@@ -222,6 +226,11 @@ class DINOv3ViTConfig(PretrainedConfig):
         # experiments
         self.num_det_tokens = num_det_tokens
         self.det_token_mode = det_token_mode
+
+        # switches
+        self.use_det_attn_alpha = use_det_attn_alpha
+        self.use_det_attn_temp = use_det_attn_temp
+        self.use_det_dynamic_rope_coords = use_det_dynamic_rope_coords
 
         # LoRA
         self.lora_r = lora_r
@@ -504,6 +513,12 @@ class DINOv3ViTAttention(nn.Module):
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.query_bias)
         self.o_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.proj_bias)
 
+        # Per-layer learnable temperature (log-space) for det attention.
+        # Temperature = exp(log_temp). Init at 0 -> temperature=1.
+        self.det_cross_attn_log_temp = (
+            nn.Parameter(torch.zeros(())) if getattr(config, "use_det_attn_temp", False) else None
+        )
+
         det_mode = getattr(config, "det_token_mode", "integrated")
         det_mode = (det_mode or "integrated").lower() if isinstance(det_mode, str) else "integrated"
         if det_mode == "separate":
@@ -591,6 +606,9 @@ class DINOv3ViTAttention(nn.Module):
             k = k.view(batch_size, len_q, self.num_heads, self.head_dim).transpose(1, 2)
             v = v.view(batch_size, len_q, self.num_heads, self.head_dim).transpose(1, 2)
 
+            det_start = num_prefix_tokens
+            det_end = num_prefix_tokens + num_det_tokens
+
             if det_rope_cos_sin is not None:
                 det_cos, det_sin = det_rope_cos_sin
                 if det_cos.shape[-2] != num_det_tokens or det_sin.shape[-2] != num_det_tokens:
@@ -613,14 +631,19 @@ class DINOv3ViTAttention(nn.Module):
 
                 det_cos = det_cos.to(device=q.device, dtype=q.dtype)
                 det_sin = det_sin.to(device=q.device, dtype=q.dtype)
-                det_start = num_prefix_tokens
-                det_end = num_prefix_tokens + num_det_tokens
                 # Avoid in-place ops on views (q comes from view+transpose), which can break autograd.
                 q_prefix = q[..., :det_start, :]
                 q_det = q[..., det_start:det_end, :]
                 q_suffix = q[..., det_end:, :]
                 q_det_rot = (q_det * det_cos) + (rotate_half(q_det) * det_sin)
                 q = torch.cat((q_prefix, q_det_rot, q_suffix), dim=-2)
+
+            if self.det_cross_attn_log_temp is not None:
+                temp = torch.exp(self.det_cross_attn_log_temp).to(device=q.device, dtype=q.dtype)
+                q_prefix = q[..., :det_start, :]
+                q_det = q[..., det_start:det_end, :] * temp
+                q_suffix = q[..., det_end:, :]
+                q = torch.cat((q_prefix, q_det, q_suffix), dim=-2)
 
             cos, sin = position_embeddings
             q, k = apply_rotary_pos_emb(q=q, k=k, cos=cos, sin=sin)
@@ -679,6 +702,9 @@ class DINOv3ViTAttention(nn.Module):
         det_query_states = det_query_states.view(batch_size, num_det_tokens, self.num_heads, self.head_dim).transpose(1, 2)
         det_key_states = det_key_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         det_value_states = det_value_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        if self.det_cross_attn_log_temp is not None:
+            det_query_states = det_query_states * torch.exp(self.det_cross_attn_log_temp)
 
         if det_rope_cos_sin is not None:
             det_cos, det_sin = det_rope_cos_sin
@@ -747,9 +773,10 @@ class DINOv3ViTAttention(nn.Module):
 
 
 class DINOv3ViTLayerScale(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config, with_alpha: bool = False) -> None:
         super().__init__()
         self.lambda1 = nn.Parameter(config.layerscale_value * torch.ones(config.hidden_size))
+        self.alpha = nn.Parameter(torch.zeros(())) if with_alpha else None
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         return hidden_state * self.lambda1
@@ -875,7 +902,12 @@ class DINOv3ViTLayer(GradientCheckpointingLayer):
         self.det_norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps) if det_mode == "separate" else None
         self.attention = DINOv3ViTAttention(config)
         self.layer_scale1 = DINOv3ViTLayerScale(config)
-        self.det_layer_scale1 = DINOv3ViTLayerScale(config) if det_mode == "separate" else None
+        self.det_layer_scale1 = DINOv3ViTLayerScale(config, with_alpha=True) if det_mode == "separate" else None
+        self.det_attn_alpha = (
+            nn.Parameter(torch.zeros(()))
+            if (det_mode == "integrated" and getattr(config, "use_det_attn_alpha", False))
+            else None
+        )
         self.drop_path = DINOv3ViTDropPath(config.drop_path_rate) if config.drop_path_rate > 0.0 else nn.Identity()
 
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -922,10 +954,26 @@ class DINOv3ViTLayer(GradientCheckpointingLayer):
         )
 
         hidden_states = self.layer_scale1(hidden_states)
-        det_tokens = self.layer_scale1(det_tokens) if det_mode == "integrated" else self.det_layer_scale1(det_tokens)
+        det_tokens_scaled = self.layer_scale1(det_tokens) if det_mode == "integrated" else self.det_layer_scale1(det_tokens)
 
         hidden_states = self.drop_path(hidden_states) + residual
-        det_tokens = self.drop_path(det_tokens) + residual_det
+        use_alpha = getattr(self.attention.config, "use_det_attn_alpha", False)
+        if det_mode == "separate":
+            if use_alpha:
+                if self.det_layer_scale1 is None or self.det_layer_scale1.alpha is None:
+                    raise RuntimeError(
+                        "det_token_mode='separate' requires det_layer_scale1.alpha, but it is missing."
+                    )
+                det_tokens = residual_det + (self.det_layer_scale1.alpha * self.drop_path(det_tokens_scaled))
+            else:
+                det_tokens = self.drop_path(det_tokens_scaled) + residual_det
+        else:
+            if use_alpha:
+                if self.det_attn_alpha is None:
+                    raise RuntimeError("use_det_attn_alpha=True requires det_attn_alpha, but it is missing.")
+                det_tokens = residual_det + (self.det_attn_alpha * self.drop_path(det_tokens_scaled))
+            else:
+                det_tokens = self.drop_path(det_tokens_scaled) + residual_det
 
         # MLP with residual connection
         residual = hidden_states
@@ -1018,6 +1066,15 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
 
         self.det_coords = nn.Parameter(torch.empty(config.num_hidden_layers, config.num_det_tokens, 2))
         nn.init.uniform_(self.det_coords, -1.0, 1.0)
+
+        self.det_rope_coord_mlp = None
+        if getattr(config, "use_det_dynamic_rope_coords", False):
+            # Predict per-det-token 2D coords in [-1, 1] (via tanh in forward).
+            self.det_rope_coord_mlp = nn.Sequential(
+                nn.Linear(config.hidden_size, config.hidden_size),
+                nn.GELU(),
+                nn.Linear(config.hidden_size, 2),
+            )
 
         if det_mode == "separate":
             self._init_det_q_proj_from_q_proj()
@@ -1148,18 +1205,31 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         hidden_states, det_tokens = self.embeddings(pixel_values, bool_masked_pos=bool_masked_pos)
         position_embeddings = self.rope_embeddings(pixel_values)
 
+        num_layers = len(self.layer)
+        use_dynamic_det_rope = (
+            getattr(self.config, "use_det_dynamic_rope_coords", False)
+            and self.det_rope_coord_mlp is not None
+        )
+
         for i, layer_module in enumerate(self.layer):
             layer_head_mask = head_mask[i] if head_mask is not None else None
-            det_coords = self.det_coords[i]
-            det_coords_clamped = det_coords.clamp(-1.0, 1.0)
-            det_coords = det_coords + (det_coords_clamped - det_coords).detach()
-            det_rope_cos_sin = get_rope_from_coords(config=self.config, coords=det_coords)
+
+            if use_dynamic_det_rope and i < (num_layers - 1):
+                # Predict coords from current det token states (bounded to [-1, 1]).
+                det_coords_dyn = torch.tanh(self.det_rope_coord_mlp(det_tokens))
+                det_rope_cos_sin = get_rope_from_coords(config=self.config, coords=det_coords_dyn)
+            else:
+                det_coords = self.det_coords[i]
+                det_coords_clamped = det_coords.clamp(-1.0, 1.0)
+                det_coords = det_coords + (det_coords_clamped - det_coords).detach()
+                det_rope_cos_sin = get_rope_from_coords(config=self.config, coords=det_coords)
+
             hidden_states, det_tokens = layer_module(
-                hidden_states = hidden_states,
-                det_tokens = det_tokens,
+                hidden_states=hidden_states,
+                det_tokens=det_tokens,
                 attention_mask=layer_head_mask,
                 position_embeddings=position_embeddings,
-                det_rope_cos_sin = det_rope_cos_sin
+                det_rope_cos_sin=det_rope_cos_sin,
             )
 
         sequence_output = self.norm(hidden_states)
@@ -1257,6 +1327,49 @@ class DINOv3Backbone(DINOv3ViTModel):
                 continue
             if name in param_dict:
                 param = param_dict[name]
+
+                if "det_rope_coord_mlp." in name:
+                    # Keep predicted coords stable at init: set output layer to 0 -> coords start near 0.
+                    with torch.no_grad():
+                        if name.endswith(".2.weight") or name.endswith(".2.bias"):
+                            param.zero_()
+                        elif name.endswith(".0.bias"):
+                            param.zero_()
+                        elif name.endswith(".0.weight"):
+                            torch.nn.init.trunc_normal_(param.data, std=self.config.initializer_range)
+                        else:
+                            torch.nn.init.trunc_normal_(param.data, std=self.config.initializer_range)
+                    handled.add(name)
+                    continue
+
+                if name.endswith(".det_cross_attn_log_temp"):
+                    with torch.no_grad():
+                        param.zero_()
+                    handled.add(name)
+                    continue
+
+                if name.endswith(".det_attn_alpha"):
+                    with torch.no_grad():
+                        param.zero_()
+                    handled.add(name)
+                    continue
+
+                if name.endswith(".det_layer_scale1.alpha"):
+                    with torch.no_grad():
+                        param.zero_()
+                    handled.add(name)
+                    continue
+
+                if name.endswith(".lora_B"):
+                    with torch.no_grad():
+                        param.zero_()
+                    handled.add(name)
+                    continue
+                if name.endswith(".lora_A"):
+                    with torch.no_grad():
+                        nn.init.kaiming_uniform_(param.data, a=math.sqrt(5))
+                    handled.add(name)
+                    continue
 
                 if name == "det_coords" or name.startswith("det_coords."):
                     with torch.no_grad():
